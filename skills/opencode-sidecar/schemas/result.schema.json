@@ -1,0 +1,98 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SidecarResult",
+  "description": "Schema for an OpenCode sidecar task result package",
+  "type": "object",
+  "required": [
+    "task_id",
+    "worker",
+    "model",
+    "status",
+    "confidence",
+    "summary"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Task identifier matching the task envelope"
+    },
+    "worker": {
+      "type": "string",
+      "enum": [
+        "code-explorer",
+        "git-diff-reviewer",
+        "log-failure-analyzer",
+        "worktree-worker"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model that executed the task"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["completed", "failed", "partial", "blocked"],
+      "description": "Task completion status"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Worker's confidence in its findings"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Brief summary of the result"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "title"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low", "info"]
+          },
+          "title": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "lines": { "type": "string" },
+                "reason": { "type": "string" }
+              }
+            }
+          },
+          "recommendation": { "type": "string" }
+        }
+      }
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "commands_run": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests_run": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "uncertainties": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "requires_main_agent_decision": {
+      "type": "boolean"
+    }
+  }
+}

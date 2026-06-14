@@ -1,0 +1,10 @@
+.agent_sidecars/
+__pycache__/
+*.pyc
+.env
+.env.*
+
+.agents/
+.claude/
+design.md
+nul

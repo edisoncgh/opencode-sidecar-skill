@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SidecarTask",
+  "description": "Schema for an OpenCode sidecar task envelope",
+  "type": "object",
+  "required": [
+    "task_id",
+    "created_at",
+    "mode",
+    "worker",
+    "model",
+    "project_dir",
+    "worktree",
+    "goal",
+    "allowed_actions",
+    "forbidden_actions",
+    "output_contract",
+    "status"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Unique task identifier, format: YYYY-MM-DD-NNN",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}-\\d{3}$"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of task creation"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["explore", "review", "log", "implement", "test-fix"],
+      "description": "Task execution mode"
+    },
+    "worker": {
+      "type": "string",
+      "enum": [
+        "code-explorer",
+        "git-diff-reviewer",
+        "log-failure-analyzer",
+        "worktree-worker"
+      ],
+      "description": "Worker agent type"
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier in provider/model format"
+    },
+    "project_dir": {
+      "type": "string",
+      "description": "Absolute path to the project directory"
+    },
+    "worktree": {
+      "type": "boolean",
+      "description": "Whether this task runs in an isolated git worktree"
+    },
+    "goal": {
+      "type": "string",
+      "description": "Clear description of what the worker should accomplish"
+    },
+    "scope": {
+      "type": "string",
+      "description": "Optional scope limitation (e.g., 'Current git diff only')"
+    },
+    "log_file": {
+      "type": "string",
+      "description": "Path to log file for analysis tasks"
+    },
+    "allowed_actions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of permitted actions for this task"
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of explicitly prohibited actions"
+    },
+    "output_contract": {
+      "type": "string",
+      "description": "Expected output format (e.g., 'result.json and result.md')"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["created", "running", "completed", "failed", "partial", "blocked"],
+      "description": "Current task status"
+    }
+  }
+}

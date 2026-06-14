@@ -1,0 +1,1235 @@
+#!/usr/bin/env python3
+"""
+OpenCode Sidecar Orchestrator
+
+Delegates bounded coding sub-tasks from Claude Code to OpenCode worker agents
+using cheaper models. Supports read-only exploration, review, log analysis,
+and isolated worktree implementation attempts.
+
+Usage:
+    python sidecar.py explore --goal "<goal>" [--model <model>] [--dir <dir>]
+    python sidecar.py review --scope "<scope>" [--model <model>] [--dir <dir>]
+    python sidecar.py log --log-file <path> --goal "<goal>" [--model <model>]
+    python sidecar.py implement --goal "<goal>" --worktree [--model <model>]
+    python sidecar.py test-fix --goal "<goal>" --worktree [--model <model>]
+    python sidecar.py collect --task-id <task-id>
+    python sidecar.py list
+    python sidecar.py cleanup --task-id <task-id>
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Terminate a worker process and all of its children.
+
+    opencode runs behind a shell/CMD wrapper that spawns node, so killing only
+    the direct child leaves orphans. On Windows we use `taskkill /T` to reap the
+    whole tree; on POSIX we signal the process group created via start_new_session.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:  # noqa: BLE001 - fall back to a direct kill
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ── Constants ──────────────────────────────────────────────────────────────
+
+SIDECAR_ROOT = ".agent_sidecars"
+TASKS_DIR = "tasks"
+WORKTREES_DIR = "worktrees"
+INDEX_FILE = "index.json"
+
+WORKER_MAP = {
+    "explore": "code-explorer",
+    "review": "git-diff-reviewer",
+    "log": "log-failure-analyzer",
+    "implement": "worktree-worker",
+    "test-fix": "worktree-worker",
+}
+
+TEMPLATE_MAP = {
+    "explore": "task_explore.md",
+    "review": "task_review.md",
+    "log": "task_log.md",
+    "implement": "task_implement.md",
+    "test-fix": "task_test_fix.md",
+}
+
+DEFAULT_TIMEOUT = {
+    "explore": 180,
+    "review": 180,
+    "log": 180,
+    "implement": 600,
+    "test-fix": 600,
+}
+
+DEFAULT_MODEL = {
+    "explore": "deepseek/deepseek-chat",
+    "review": "deepseek/deepseek-chat",
+    "log": "deepseek/deepseek-chat",
+    "implement": "deepseek/deepseek-chat",
+    "test-fix": "deepseek/deepseek-chat",
+}
+
+ENV_MODEL_MAP = {
+    "explore": "OPENCODE_SIDECAR_EXPLORE_MODEL",
+    "review": "OPENCODE_SIDECAR_REVIEW_MODEL",
+    "log": "OPENCODE_SIDECAR_LOG_MODEL",
+    "implement": "OPENCODE_SIDECAR_IMPLEMENT_MODEL",
+    "test-fix": "OPENCODE_SIDECAR_TEST_FIX_MODEL",
+}
+
+SENSITIVE_FILES = [
+    ".env", ".env.",
+    "*.pem", "*.key", "*.p12", "*.pfx",
+    "id_rsa", "id_ed25519",
+    "secrets.", "credentials.",
+]
+
+FORBIDDEN_COMMANDS = [
+    "git commit", "git push",
+    "npm install", "pnpm add", "yarn add",
+    "pip install",
+    "docker compose up", "docker compose down",
+    "rm -rf",
+]
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def generate_task_id() -> str:
+    """Atomically claim a unique task ID in YYYY-MM-DD-NNN format.
+
+    Concurrency-safe: the task directory is created with exist_ok=False as part
+    of ID generation, so the OS guarantees only one caller can win a given ID.
+    If two sidecar processes start at the same instant, the loser's mkdir fails
+    and it retries with the next number rather than silently reusing an ID
+    (which would cause two workers to write into the same task directory).
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    sidecar_dir = Path(SIDECAR_ROOT)
+    tasks_dir = sidecar_dir / TASKS_DIR
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine the highest existing number for today as a starting point.
+    existing_nums = []
+    for d in tasks_dir.iterdir():
+        if d.is_dir() and d.name.startswith(today):
+            try:
+                existing_nums.append(int(d.name.split("-")[-1]))
+            except ValueError:
+                pass
+    start = (max(existing_nums) + 1) if existing_nums else 1
+
+    # Probe upward, claiming the first number whose directory we can create.
+    for num in range(start, start + 1000):
+        task_id = f"{today}-{num:03d}"
+        try:
+            (tasks_dir / task_id).mkdir(exist_ok=False)
+            return task_id
+        except FileExistsError:
+            continue  # lost the race for this id; try the next one
+
+    raise RuntimeError("Could not allocate a unique task id after 1000 attempts.")
+
+
+def resolve_model(mode: str, cli_model: str | None = None) -> str:
+    """Resolve model from CLI arg, environment variable, or default."""
+    if cli_model:
+        return cli_model
+    env_var = ENV_MODEL_MAP.get(mode)
+    if env_var:
+        env_model = os.environ.get(env_var)
+        if env_model:
+            return env_model
+    default_model = os.environ.get("OPENCODE_SIDECAR_DEFAULT_MODEL")
+    if default_model:
+        return default_model
+    return DEFAULT_MODEL.get(mode, "deepseek/deepseek-chat")
+
+
+def parse_patch_files(patch_text: str) -> set[str]:
+    """Extract the set of file paths touched by a unified diff / git patch.
+
+    Reads the `diff --git a/<path> b/<path>` headers (and falls back to
+    `+++ b/<path>` lines) so the main agent can detect when two parallel
+    worktree patches modify the same file before applying either.
+    """
+    files: set[str] = set()
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            # Format: diff --git a/path b/path
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                files.add(parts[1].strip())
+        elif line.startswith("+++ "):
+            path = line[4:].strip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if path and path != "/dev/null":
+                files.add(path)
+    return files
+
+
+def get_skill_dir() -> Path:
+    """Get the skill directory containing this script."""
+    return Path(__file__).resolve().parent.parent
+def get_templates_dir() -> Path:
+    """Get the templates directory."""
+    return get_skill_dir() / "templates"
+
+
+def check_git_repo(project_dir: Path) -> bool:
+    """Check if the given directory is inside a git repository."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def check_opencode_available() -> bool:
+    """Check if opencode CLI is available."""
+    return get_opencode_path() is not None
+
+
+def get_opencode_path() -> str | None:
+    """Get the full path to the opencode executable."""
+    return shutil.which("opencode")
+
+
+def check_dirty_worktree(project_dir: Path) -> bool:
+    """Check if the working tree has uncommitted changes."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def load_template(mode: str, task_id: str, goal: str, scope: str = "", log_file: str = "", worktree_path: str = "") -> str:
+    """Load and fill a task template."""
+    template_name = TEMPLATE_MAP.get(mode)
+    if not template_name:
+        return f"# Sidecar Task\n\nTask ID: {task_id}\nGoal: {goal}\n"
+
+    template_path = get_templates_dir() / template_name
+    if not template_path.exists():
+        return f"# Sidecar Task\n\nTask ID: {task_id}\nGoal: {goal}\n"
+
+    content = template_path.read_text(encoding="utf-8")
+    content = content.replace("{{TASK_ID}}", task_id)
+    content = content.replace("{{GOAL}}", goal)
+    content = content.replace("{{SCOPE}}", scope or "Current repository.")
+    content = content.replace("{{LOG_FILE}}", log_file or "N/A")
+    content = content.replace("{{WORKTREE_PATH}}", worktree_path or "N/A")
+    return content
+
+
+def check_sensitive_files(patch_content: str) -> list[str]:
+    """Check if patch touches sensitive files."""
+    warnings = []
+    for line in patch_content.split("\n"):
+        if line.startswith("diff --git"):
+            for pattern in SENSITIVE_FILES:
+                if pattern in line:
+                    warnings.append(f"Patch touches sensitive file pattern: {pattern} (line: {line.strip()})")
+    return warnings
+
+
+def _extract_executed_commands(output: str) -> list[str] | None:
+    """Pull actually-executed shell commands out of opencode JSON event output.
+
+    opencode --format json emits one JSON object per line; a real shell
+    invocation appears as a tool part with tool=="bash" and
+    input.command=="...". Returns the list of executed command strings, or
+    None if the output isn't structured JSON events (so the caller can fall
+    back to a raw substring scan).
+    """
+    commands: list[str] = []
+    saw_json = False
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        saw_json = True
+        part = event.get("part") if isinstance(event, dict) else None
+        if isinstance(part, dict) and part.get("tool") == "bash":
+            state = part.get("state") or {}
+            inp = state.get("input") or {}
+            cmd = inp.get("command")
+            if isinstance(cmd, str):
+                commands.append(cmd)
+    return commands if saw_json else None
+
+
+def check_forbidden_commands(output: str) -> list[str]:
+    """Flag forbidden command invocations the worker actually executed.
+
+    Prefers parsing the structured JSON event stream so that forbidden strings
+    appearing only in the agent's narration or injected reminders are not
+    mistaken for executed commands. Falls back to a raw substring scan for
+    plain-text output.
+    """
+    executed = _extract_executed_commands(output)
+    haystacks = executed if executed is not None else [output]
+
+    violations = []
+    for cmd in FORBIDDEN_COMMANDS:
+        if any(cmd in h for h in haystacks):
+            violations.append(f"Forbidden command detected: {cmd}")
+    return violations
+
+
+def write_json(path: Path, data: dict) -> None:
+    """Write JSON data to a file."""
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def read_json(path: Path) -> dict | None:
+    """Read JSON data from a file."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, FileNotFoundError):
+        return None
+
+
+# ── Task Config ────────────────────────────────────────────────────────────
+
+class TaskConfig:
+    """Configuration for a sidecar task."""
+
+    def __init__(self, mode: str, goal: str, model: str, project_dir: Path,
+                 worktree: bool = False, scope: str = "", log_file: str = "",
+                 timeout: int | None = None):
+        self.task_id = generate_task_id()
+        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.mode = mode
+        self.worker = WORKER_MAP[mode]
+        self.model = model
+        self.project_dir = str(project_dir.resolve())
+        self.worktree = worktree
+        self.goal = goal
+        self.scope = scope
+        self.log_file = log_file
+        self.timeout = timeout or DEFAULT_TIMEOUT.get(mode, 300)
+        self.status = "created"
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "created_at": self.created_at,
+            "mode": self.mode,
+            "worker": self.worker,
+            "model": self.model,
+            "project_dir": self.project_dir,
+            "worktree": self.worktree,
+            "goal": self.goal,
+            "scope": self.scope,
+            "log_file": self.log_file,
+            "allowed_actions": self._allowed_actions(),
+            "forbidden_actions": self._forbidden_actions(),
+            "output_contract": "result.json and result.md",
+            "status": self.status,
+        }
+
+    def _allowed_actions(self) -> list[str]:
+        base = ["read_files", "list_files", "search_files", "run_git_status", "run_git_diff"]
+        if self.mode in ("explore", "review", "log"):
+            base.append("run_search_commands")
+        if self.mode in ("implement", "test-fix"):
+            base.extend(["edit_files_in_worktree", "run_tests", "run_lint"])
+        return base
+
+    def _forbidden_actions(self) -> list[str]:
+        base = ["commit", "push", "install_dependencies", "read_secrets", "deploy"]
+        if self.mode in ("explore", "review", "log"):
+            base.append("modify_files")
+        if self.mode in ("implement", "test-fix"):
+            base.extend(["edit_main_worktree", "modify_env_files"])
+        return base
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────────
+
+class SidecarOrchestrator:
+    """Main orchestrator for sidecar tasks."""
+
+    def __init__(self, project_dir: Path):
+        self.project_dir = project_dir.resolve()
+        self.sidecar_dir = self.project_dir / SIDECAR_ROOT
+        self.tasks_dir = self.sidecar_dir / TASKS_DIR
+        self.worktrees_dir = self.sidecar_dir / WORKTREES_DIR
+
+    def ensure_dirs(self) -> None:
+        """Create sidecar directories if they don't exist."""
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        self.worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_task_dir(self, task_id: str) -> Path:
+        """Get the directory for a specific task."""
+        return self.tasks_dir / task_id
+
+    def update_index(self, task_config: TaskConfig) -> None:
+        """Update the sidecar index with task info."""
+        index_path = self.sidecar_dir / INDEX_FILE
+        index = read_json(index_path) or {"tasks": []}
+        index["tasks"].append({
+            "task_id": task_config.task_id,
+            "mode": task_config.mode,
+            "worker": task_config.worker,
+            "model": task_config.model,
+            "status": task_config.status,
+            "created_at": task_config.created_at,
+        })
+        write_json(index_path, index)
+
+    def create_worktree(self, task_id: str) -> Path | None:
+        """Create a git worktree for writable tasks."""
+        worktree_path = self.worktrees_dir / task_id
+        branch_name = f"sidecar/{task_id}"
+
+        # Try to create worktree with unique branch name
+        for suffix in ["", "-1", "-2", "-3"]:
+            try_branch = branch_name + suffix
+            result = subprocess.run(
+                ["git", "worktree", "add", str(worktree_path), "-b", try_branch],
+                cwd=self.project_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return worktree_path
+            if "already exists" not in result.stderr:
+                break
+
+        print(f"ERROR: Failed to create worktree for task {task_id}", file=sys.stderr)
+        print(f"  stderr: {result.stderr.strip()}", file=sys.stderr)
+        return None
+
+    def remove_worktree(self, task_id: str) -> bool:
+        """Remove a git worktree."""
+        worktree_path = self.worktrees_dir / task_id
+        if not worktree_path.exists():
+            return True
+
+        result = subprocess.run(
+            ["git", "worktree", "remove", str(worktree_path), "--force"],
+            cwd=self.project_dir,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+
+    def run_task(self, task_config: TaskConfig) -> dict:
+        """Execute a sidecar task and return results."""
+        self.ensure_dirs()
+        task_dir = self.get_task_dir(task_config.task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write task envelope
+        task_config.status = "running"
+        write_json(task_dir / "task.json", task_config.to_dict())
+        task_md = load_template(
+            task_config.mode,
+            task_config.task_id,
+            task_config.goal,
+            task_config.scope,
+            task_config.log_file,
+            str(self.worktrees_dir / task_config.task_id) if task_config.worktree else "",
+        )
+        (task_dir / "task.md").write_text(task_md, encoding="utf-8")
+
+        # Update index
+        self.update_index(task_config)
+
+        # Create worktree if needed
+        worktree_path = None
+        if task_config.worktree:
+            worktree_path = self.create_worktree(task_config.task_id)
+            if not worktree_path:
+                task_config.status = "failed"
+                self._write_error_result(task_dir, task_config, "Failed to create git worktree.")
+                return self._build_return(task_config, task_dir)
+
+        # Build opencode command
+        cmd = self._build_command(task_config, worktree_path)
+        print(f"Running: {' '.join(cmd)}", file=sys.stderr)
+
+        # Execute opencode, streaming output straight to log files so that
+        # partial output is preserved even if the worker is killed on timeout.
+        # (Capturing in-memory and discarding on TimeoutExpired loses the
+        # worker's answer when it produces output but lingers before exiting.)
+        stdout, stderr, returncode = self._run_opencode_streamed(
+            cmd, worktree_path, task_dir, task_config.timeout
+        )
+
+        # Security checks
+        security_warnings = []
+        security_warnings.extend(check_forbidden_commands(stdout))
+        security_warnings.extend(check_forbidden_commands(stderr))
+
+        # Export patch for writable tasks
+        if task_config.worktree and worktree_path and worktree_path.exists():
+            self._export_patch(task_config.task_id, worktree_path, task_dir)
+            self._export_files_changed(task_config.task_id, worktree_path, task_dir)
+
+            # Check sensitive files in patch
+            patch_path = task_dir / "patch.diff"
+            if patch_path.exists():
+                patch_content = patch_path.read_text(encoding="utf-8")
+                security_warnings.extend(check_sensitive_files(patch_content))
+
+        # Determine status
+        if returncode != 0:
+            task_config.status = "failed"
+        elif not stdout.strip():
+            task_config.status = "partial"
+        else:
+            task_config.status = "completed"
+
+        # Generate result files
+        self._generate_result(task_config, task_dir, stdout, stderr, security_warnings, returncode)
+
+        # Write metadata
+        metadata = {
+            "task_id": task_config.task_id,
+            "mode": task_config.mode,
+            "worker": task_config.worker,
+            "model": task_config.model,
+            "status": task_config.status,
+            "returncode": returncode,
+            "timeout": task_config.timeout,
+            "worktree": task_config.worktree,
+            "worktree_path": str(worktree_path) if worktree_path else None,
+            "project_dir": task_config.project_dir,
+            "started_at": task_config.created_at,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "security_warnings": security_warnings,
+        }
+        write_json(task_dir / "metadata.json", metadata)
+
+        # Update index with final status
+        self.update_index(task_config)
+
+        return self._build_return(task_config, task_dir)
+
+    def _run_opencode_streamed(
+        self,
+        cmd: list[str],
+        worktree_path: Path | None,
+        task_dir: Path,
+        timeout: int,
+    ) -> tuple[str, str, int]:
+        """Run opencode, streaming stdout/stderr to log files in real time.
+
+        Returns (stdout, stderr, returncode). On timeout the worker is killed
+        but whatever it had already written to the logs is preserved and
+        returned, so a worker that produced an answer but lingered is not lost.
+        """
+        stdout_path = task_dir / "stdout.log"
+        stderr_path = task_dir / "stderr.log"
+        cwd = str(worktree_path or self.project_dir)
+
+        # Launch in a new process group / job so we can kill the whole tree on
+        # timeout. opencode is spawned via a CMD/shell wrapper on Windows that
+        # itself spawns node; a plain proc.kill() would only reap the wrapper
+        # and leave an orphaned worker running (burning tokens, holding file
+        # handles open).
+        popen_kwargs = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        try:
+            with open(stdout_path, "w", encoding="utf-8") as out_f, \
+                 open(stderr_path, "w", encoding="utf-8") as err_f:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdout=out_f,
+                    stderr=err_f,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    **popen_kwargs,
+                )
+                try:
+                    returncode = proc.wait(timeout=timeout)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    _kill_process_tree(proc)
+                    returncode = -1
+                    timed_out = True
+        except FileNotFoundError:
+            stderr_path.write_text(
+                "opencode command not found. Please install OpenCode first.",
+                encoding="utf-8",
+            )
+            return "", "opencode command not found.", -1
+        except Exception as e:  # noqa: BLE001 - surface any launch failure
+            msg = f"Unexpected error running opencode: {e}"
+            stderr_path.write_text(msg, encoding="utf-8")
+            return "", msg, -1
+
+        # Read back whatever was written (preserved even after a kill).
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+
+        if timed_out:
+            note = (
+                f"\n[sidecar] Task timed out after {timeout} seconds; "
+                f"worker killed. Partial output above (if any) was preserved."
+            )
+            stderr = stderr + note
+            stderr_path.write_text(stderr, encoding="utf-8")
+
+        return stdout, stderr, returncode
+
+    def _build_command(self, task_config: TaskConfig, worktree_path: Path | None) -> list[str]:
+        """Build the opencode run command."""
+        opencode_path = get_opencode_path()
+        if not opencode_path:
+            raise RuntimeError("opencode command not found. Please install OpenCode first.")
+        cmd = [opencode_path, "run"]
+
+        # Directory
+        target_dir = str(worktree_path or self.project_dir)
+        cmd.extend(["--dir", target_dir])
+
+        # Model
+        cmd.extend(["--model", task_config.model])
+
+        # Format
+        cmd.extend(["--format", "json"])
+
+        # Title
+        cmd.extend(["--title", f"sidecar-{task_config.task_id}"])
+
+        # Message - the task prompt (role embedded, no --agent needed)
+        prompt = self._build_prompt(task_config)
+        cmd.append(prompt)
+
+        return cmd
+
+    def _build_prompt(self, task_config: TaskConfig) -> str:
+        """Build the task prompt for the worker."""
+        # Direct task instructions — no role preamble, just tell it what to do
+        parts = [
+            f"TASK: {task_config.goal}",
+        ]
+
+        if task_config.scope:
+            parts.append(f"SCOPE: {task_config.scope}")
+
+        if task_config.log_file:
+            parts.append(f"LOG FILE: {task_config.log_file}")
+
+        if task_config.worktree:
+            parts.append("NOTE: You are in an isolated git worktree. Only edit files here.")
+
+        # Mode-specific constraints
+        if task_config.mode in ("explore", "review", "log"):
+            parts.append("CONSTRAINT: Do NOT modify any files. Read-only analysis only.")
+
+        if task_config.mode == "review":
+            parts.append("CONSTRAINT: Do NOT commit or push.")
+
+        if task_config.mode in ("implement", "test-fix"):
+            parts.append("CONSTRAINT: Do NOT commit, push, or install dependencies.")
+
+        parts.append("")
+        parts.append("Execute this task now using the available tools.")
+        parts.append("Produce a structured final report with your findings.")
+
+        return "\n".join(parts)
+
+    def _generate_result(self, task_config: TaskConfig, task_dir: Path,
+                         stdout: str, stderr: str, security_warnings: list[str],
+                         returncode: int) -> None:
+        """Generate result.md and result.json from worker output."""
+        # Try to extract JSON from stdout
+        result_json = self._extract_result_json(stdout, task_config)
+
+        # Generate result.md
+        result_md_parts = [
+            f"# Sidecar Result",
+            f"",
+            f"## Task ID",
+            f"",
+            f"{task_config.task_id}",
+            f"",
+            f"## Worker",
+            f"",
+            f"{task_config.worker} ({task_config.model})",
+            f"",
+            f"## Status",
+            f"",
+            f"{task_config.status}",
+            f"",
+        ]
+
+        if security_warnings:
+            result_md_parts.extend([
+                "## ⚠️ Security Warnings",
+                "",
+            ])
+            for warning in security_warnings:
+                result_md_parts.append(f"- {warning}")
+            result_md_parts.append("")
+
+        if task_config.worktree:
+            result_md_parts.extend([
+                "## Patch",
+                "",
+                "WARNING: This patch was generated by a sidecar worker.",
+                "The main agent must review `patch.diff` before applying.",
+                "",
+            ])
+
+        if stdout.strip():
+            result_md_parts.extend([
+                "## Worker Output",
+                "",
+                "```",
+                stdout[:10000],  # Truncate very long output
+                "```",
+                "",
+            ])
+        else:
+            result_md_parts.extend([
+                "## Worker Output",
+                "",
+                "(empty)",
+                "",
+            ])
+
+        if stderr.strip():
+            result_md_parts.extend([
+                "## Errors",
+                "",
+                "```",
+                stderr[:5000],
+                "```",
+                "",
+            ])
+
+        (task_dir / "result.md").write_text("\n".join(result_md_parts), encoding="utf-8")
+
+        # Generate result.json
+        write_json(task_dir / "result.json", result_json)
+
+    def _extract_result_json(self, stdout: str, task_config: TaskConfig) -> dict:
+        """Try to extract structured JSON result from worker output."""
+        # Look for JSON blocks in the output
+        json_candidates = []
+        in_json = False
+        json_lines = []
+
+        for line in stdout.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```json") or stripped.startswith("```"):
+                if in_json:
+                    json_candidates.append("\n".join(json_lines))
+                    json_lines = []
+                    in_json = False
+                else:
+                    in_json = True
+                continue
+            if in_json:
+                json_lines.append(line)
+
+        if json_lines:
+            json_candidates.append("\n".join(json_lines))
+
+        # Try to parse each candidate
+        for candidate in json_candidates:
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and ("task_id" in data or "summary" in data):
+                    data.setdefault("task_id", task_config.task_id)
+                    data.setdefault("worker", task_config.worker)
+                    data.setdefault("model", task_config.model)
+                    data.setdefault("status", task_config.status)
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+        # Try to find JSON object in the entire output
+        for start_char in ["{"]:
+            idx = stdout.find(start_char)
+            while idx != -1:
+                for end_idx in range(len(stdout) - 1, idx, -1):
+                    if stdout[end_idx] == "}":
+                        try:
+                            data = json.loads(stdout[idx:end_idx + 1])
+                            if isinstance(data, dict) and len(data) > 2:
+                                data.setdefault("task_id", task_config.task_id)
+                                data.setdefault("worker", task_config.worker)
+                                data.setdefault("model", task_config.model)
+                                data.setdefault("status", task_config.status)
+                                return data
+                        except json.JSONDecodeError:
+                            pass
+                idx = stdout.find(start_char, idx + 1)
+
+        # Fallback: create a basic result from the output
+        return {
+            "task_id": task_config.task_id,
+            "worker": task_config.worker,
+            "model": task_config.model,
+            "status": task_config.status,
+            "confidence": "low",
+            "summary": stdout[:500] if stdout.strip() else "No output captured.",
+            "findings": [],
+            "files_changed": [],
+            "commands_run": [],
+            "tests_run": [],
+            "risks": ["Worker did not produce structured JSON output."],
+            "uncertainties": ["Result was auto-generated from raw output."],
+            "requires_main_agent_decision": True,
+        }
+
+    def _export_patch(self, task_id: str, worktree_path: Path, task_dir: Path) -> None:
+        """Export git diff as patch from worktree."""
+        result = subprocess.run(
+            ["git", "diff"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            (task_dir / "patch.diff").write_text(result.stdout, encoding="utf-8")
+            print(f"Patch exported: {task_dir / 'patch.diff'}", file=sys.stderr)
+        else:
+            print("No changes to export (empty diff).", file=sys.stderr)
+
+    def _export_files_changed(self, task_id: str, worktree_path: Path, task_dir: Path) -> None:
+        """Export list of changed files from worktree."""
+        result = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            (task_dir / "files-changed.txt").write_text(result.stdout, encoding="utf-8")
+
+    def _write_error_result(self, task_dir: Path, task_config: TaskConfig, error_msg: str) -> None:
+        """Write error result files."""
+        result = {
+            "task_id": task_config.task_id,
+            "worker": task_config.worker,
+            "model": task_config.model,
+            "status": "failed",
+            "confidence": "low",
+            "summary": error_msg,
+            "findings": [],
+            "risks": [error_msg],
+            "requires_main_agent_decision": True,
+        }
+        write_json(task_dir / "result.json", result)
+        (task_dir / "result.md").write_text(f"# Sidecar Result\n\nStatus: failed\n\n{error_msg}\n", encoding="utf-8")
+        write_json(task_dir / "metadata.json", {
+            "task_id": task_config.task_id,
+            "status": "failed",
+            "error": error_msg,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def _build_return(self, task_config: TaskConfig, task_dir: Path) -> dict:
+        """Build the return dictionary for the orchestrator."""
+        return {
+            "task_id": task_config.task_id,
+            "status": task_config.status,
+            "task_dir": str(task_dir),
+            "result_md": str(task_dir / "result.md"),
+            "result_json": str(task_dir / "result.json"),
+            "metadata_json": str(task_dir / "metadata.json"),
+            "stdout_log": str(task_dir / "stdout.log"),
+            "stderr_log": str(task_dir / "stderr.log"),
+            "patch_diff": str(task_dir / "patch.diff") if task_config.worktree else None,
+        }
+
+
+# ── CLI Commands ───────────────────────────────────────────────────────────
+
+def cmd_explore(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run an exploration task."""
+    model = resolve_model("explore", args.model)
+    config = TaskConfig(
+        mode="explore",
+        goal=args.goal,
+        model=model,
+        project_dir=orchestrator.project_dir,
+        timeout=args.timeout,
+    )
+    result = orchestrator.run_task(config)
+    print_result(result)
+
+
+def cmd_review(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run a review task."""
+    model = resolve_model("review", args.model)
+    config = TaskConfig(
+        mode="review",
+        goal=args.goal or "Review the current git diff for correctness and missing tests.",
+        model=model,
+        project_dir=orchestrator.project_dir,
+        scope=args.scope or "Current git diff only.",
+        timeout=args.timeout,
+    )
+    result = orchestrator.run_task(config)
+    print_result(result)
+
+
+def cmd_log(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run a log analysis task."""
+    model = resolve_model("log", args.model)
+    config = TaskConfig(
+        mode="log",
+        goal=args.goal,
+        model=model,
+        project_dir=orchestrator.project_dir,
+        log_file=args.log_file,
+        timeout=args.timeout,
+    )
+    result = orchestrator.run_task(config)
+    print_result(result)
+
+
+def cmd_implement(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run an implementation task in an isolated worktree."""
+    model = resolve_model("implement", args.model)
+    config = TaskConfig(
+        mode="implement",
+        goal=args.goal,
+        model=model,
+        project_dir=orchestrator.project_dir,
+        worktree=args.worktree,
+        timeout=args.timeout,
+    )
+    result = orchestrator.run_task(config)
+    print_result(result)
+
+
+def cmd_test_fix(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run a test fix task in an isolated worktree."""
+    model = resolve_model("test-fix", args.model)
+    config = TaskConfig(
+        mode="test-fix",
+        goal=args.goal,
+        model=model,
+        project_dir=orchestrator.project_dir,
+        worktree=args.worktree,
+        timeout=args.timeout,
+    )
+    result = orchestrator.run_task(config)
+    print_result(result)
+
+
+def cmd_collect(args, orchestrator: SidecarOrchestrator) -> None:
+    """Collect and display results for a task."""
+    task_dir = orchestrator.get_task_dir(args.task_id)
+    if not task_dir.exists():
+        print(f"ERROR: Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    result_md = task_dir / "result.md"
+    result_json = task_dir / "result.json"
+    metadata = task_dir / "metadata.json"
+
+    print(f"Task ID: {args.task_id}")
+    print(f"Task dir: {task_dir}")
+    print()
+
+    if metadata.exists():
+        data = read_json(metadata)
+        print(f"Status: {data.get('status', 'unknown')}")
+        print(f"Model: {data.get('model', 'unknown')}")
+        print()
+
+    if result_md.exists():
+        print(result_md.read_text(encoding="utf-8"))
+    else:
+        print("No result.md found.")
+
+    if result_json.exists():
+        print("\n--- result.json ---")
+        print(json.dumps(read_json(result_json), indent=2, ensure_ascii=False))
+
+
+def cmd_list(args, orchestrator: SidecarOrchestrator) -> None:
+    """List all sidecar tasks."""
+    index_path = orchestrator.sidecar_dir / INDEX_FILE
+    if not index_path.exists():
+        print("No tasks found.")
+        return
+
+    index = read_json(index_path)
+    if not index or not index.get("tasks"):
+        print("No tasks found.")
+        return
+
+    print(f"{'Task ID':<20} {'Mode':<12} {'Worker':<25} {'Status':<12} {'Model'}")
+    print("-" * 90)
+    for task in index["tasks"]:
+        print(f"{task['task_id']:<20} {task['mode']:<12} {task['worker']:<25} {task['status']:<12} {task['model']}")
+
+
+def cmd_cleanup(args, orchestrator: SidecarOrchestrator) -> None:
+    """Clean up a task and its worktree."""
+    task_dir = orchestrator.get_task_dir(args.task_id)
+    if not task_dir.exists():
+        print(f"ERROR: Task {args.task_id} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check if task has a worktree
+    metadata = read_json(task_dir / "metadata.json")
+    if metadata and metadata.get("worktree"):
+        print(f"Removing worktree for task {args.task_id}...")
+        orchestrator.remove_worktree(args.task_id)
+
+    # Remove task directory
+    shutil.rmtree(task_dir)
+    print(f"Task {args.task_id} cleaned up.")
+
+    # Update index
+    index_path = orchestrator.sidecar_dir / INDEX_FILE
+    if index_path.exists():
+        index = read_json(index_path)
+        if index and "tasks" in index:
+            index["tasks"] = [t for t in index["tasks"] if t["task_id"] != args.task_id]
+            write_json(index_path, index)
+
+
+def cmd_check_conflicts(args, orchestrator: SidecarOrchestrator) -> None:
+    """Detect file overlaps between worktree task patches.
+
+    When several writable workers run in parallel, each produces an isolated
+    patch.diff. Before the main agent applies any of them it must know whether
+    two patches touch the same file (a lost-update hazard). This command maps
+    each task's patch to the files it changes and reports every overlap.
+    """
+    tasks_dir = orchestrator.tasks_dir
+    if not tasks_dir.exists():
+        print("No tasks found.")
+        return
+
+    # task_id -> set(files), only for tasks that produced a patch
+    task_files: dict[str, set[str]] = {}
+    for task_dir in sorted(tasks_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        patch_path = task_dir / "patch.diff"
+        if patch_path.exists():
+            files = parse_patch_files(patch_path.read_text(encoding="utf-8", errors="replace"))
+            if files:
+                task_files[task_dir.name] = files
+
+    if not task_files:
+        print("No patches found. Nothing to check.")
+        return
+
+    # file -> [task_ids that touch it]
+    file_owners: dict[str, list[str]] = {}
+    for task_id, files in task_files.items():
+        for f in files:
+            file_owners.setdefault(f, []).append(task_id)
+
+    conflicts = {f: owners for f, owners in file_owners.items() if len(owners) > 1}
+
+    print(f"Checked {len(task_files)} patch(es) across {len(file_owners)} file(s).")
+    print()
+    if not conflicts:
+        print("No conflicts: every patched file is touched by exactly one task.")
+        print("Patches can be reviewed and applied independently.")
+        return
+
+    print(f"WARNING: {len(conflicts)} file(s) are modified by more than one task.")
+    print("The main agent must reconcile these before applying any patch:")
+    print()
+    for f in sorted(conflicts):
+        print(f"  {f}")
+        for task_id in sorted(conflicts[f]):
+            print(f"      <- {task_id}")
+
+
+# ── Output ─────────────────────────────────────────────────────────────────
+
+def print_result(result: dict) -> None:
+    """Print the final result summary."""
+    print()
+    print("Sidecar task completed.")
+    print()
+    print(f"Task ID: {result['task_id']}")
+    print(f"Status: {result['status']}")
+    print(f"Result: {result['result_md']}")
+    print(f"JSON: {result['result_json']}")
+    if result.get("patch_diff"):
+        print(f"Patch: {result['patch_diff']}")
+    print()
+
+    if result["status"] == "failed":
+        print("[WARNING] Task failed. Check stderr.log for details.")
+        stderr_path = Path(result["stderr_log"])
+        if stderr_path.exists():
+            stderr = stderr_path.read_text(encoding="utf-8")
+            if stderr.strip():
+                print(f"Errors:\n{stderr[:1000]}")
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="OpenCode Sidecar Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # explore
+    p_explore = subparsers.add_parser("explore", help="Run codebase exploration")
+    p_explore.add_argument("--goal", required=True, help="Exploration goal")
+    p_explore.add_argument("--model", help="Model to use")
+    p_explore.add_argument("--dir", help="Project directory")
+    p_explore.add_argument("--timeout", type=int, help="Timeout in seconds")
+
+    # review
+    p_review = subparsers.add_parser("review", help="Run code review")
+    p_review.add_argument("--goal", help="Review goal")
+    p_review.add_argument("--scope", help="Review scope")
+    p_review.add_argument("--model", help="Model to use")
+    p_review.add_argument("--dir", help="Project directory")
+    p_review.add_argument("--timeout", type=int, help="Timeout in seconds")
+
+    # log
+    p_log = subparsers.add_parser("log", help="Run log analysis")
+    p_log.add_argument("--goal", required=True, help="Analysis goal")
+    p_log.add_argument("--log-file", required=True, help="Path to log file")
+    p_log.add_argument("--model", help="Model to use")
+    p_log.add_argument("--dir", help="Project directory")
+    p_log.add_argument("--timeout", type=int, help="Timeout in seconds")
+
+    # implement
+    p_implement = subparsers.add_parser("implement", help="Run implementation")
+    p_implement.add_argument("--goal", required=True, help="Implementation goal")
+    p_implement.add_argument("--worktree", action="store_true", help="Use isolated worktree")
+    p_implement.add_argument("--model", help="Model to use")
+    p_implement.add_argument("--dir", help="Project directory")
+    p_implement.add_argument("--timeout", type=int, help="Timeout in seconds")
+
+    # test-fix
+    p_test_fix = subparsers.add_parser("test-fix", help="Run test fix")
+    p_test_fix.add_argument("--goal", required=True, help="Test fix goal")
+    p_test_fix.add_argument("--worktree", action="store_true", help="Use isolated worktree")
+    p_test_fix.add_argument("--model", help="Model to use")
+    p_test_fix.add_argument("--dir", help="Project directory")
+    p_test_fix.add_argument("--timeout", type=int, help="Timeout in seconds")
+
+    # collect
+    p_collect = subparsers.add_parser("collect", help="Collect task results")
+    p_collect.add_argument("--task-id", required=True, help="Task ID")
+
+    # list
+    subparsers.add_parser("list", help="List all tasks")
+
+    # cleanup
+    p_cleanup = subparsers.add_parser("cleanup", help="Clean up a task")
+    p_cleanup.add_argument("--task-id", required=True, help="Task ID")
+
+    # check-conflicts
+    subparsers.add_parser(
+        "check-conflicts",
+        help="Detect file overlaps between worktree task patches",
+    )
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Determine project directory
+    project_dir = Path(getattr(args, "dir", None) or os.getcwd())
+
+    # Pre-flight checks
+    if not check_git_repo(project_dir):
+        print(f"ERROR: {project_dir} is not inside a git repository.", file=sys.stderr)
+        print("Please run this command from within a git repository.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command not in ("collect", "list", "cleanup", "check-conflicts"):
+        if not check_opencode_available():
+            print("ERROR: opencode command not found.", file=sys.stderr)
+            print("Please install OpenCode: https://github.com/opencode-ai/opencode", file=sys.stderr)
+            sys.exit(1)
+
+    # Create orchestrator and run command
+    orchestrator = SidecarOrchestrator(project_dir)
+
+    commands = {
+        "explore": cmd_explore,
+        "review": cmd_review,
+        "log": cmd_log,
+        "implement": cmd_implement,
+        "test-fix": cmd_test_fix,
+        "collect": cmd_collect,
+        "list": cmd_list,
+        "cleanup": cmd_cleanup,
+        "check-conflicts": cmd_check_conflicts,
+    }
+
+    commands[args.command](args, orchestrator)
+
+
+if __name__ == "__main__":
+    main()
