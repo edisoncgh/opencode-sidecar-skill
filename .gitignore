@@ -6,5 +6,7 @@ __pycache__/
 
 .agents/
 .claude/
+.opencode/
+.opencode-sidecar.json
 design.md
 nul

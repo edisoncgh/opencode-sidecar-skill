@@ -1,140 +1,121 @@
-# OpenCode Sidecar Skill
+# OpenCode Sidecar
 
-A Claude Code Skill that delegates bounded coding sub-tasks to OpenCode worker agents using cheaper models, while keeping the main Claude agent in control of final decisions.
+**Strong model thinks. Cheap model works.**
 
-> 中文文档见 [skills/opencode-sidecar/README.zh-CN.md](skills/opencode-sidecar/README.zh-CN.md)
+You're running Opus or GPT in Claude Code — the smartest agent in the room. But
+it's expensive, and a lot of what it does is grunt work: reading a hundred files
+to find where a function lives, scanning a 50KB log for the actual error, doing
+a first-pass review of a diff. That's not what you're paying premium tokens for.
 
-## Overview
+This skill lets the strong model stay the **brain** — plan, judge, decide — while
+offloading the token-heavy, bounded stuff to a cheaper OpenCode worker
+(DeepSeek, MiMo, Qwen, whatever you've authed). The brain reads the worker's
+findings, sanity-checks them, and decides what to do. The worker never touches
+the main working tree.
 
-This skill implements a **sidecar execution system** where:
+```
+   Claude (the brain)            OpenCode worker (the hands)
+   ───────────────────           ───────────────────────────
+   plan → delegate task    ──►   explore / review / log
+                              ◄──   structured findings
+   verify, synthesize           implement / test-fix
+   decide & merge          ──►   (in isolated worktree)
+                              ◄──   patch (you review before applying)
+```
 
-- **Main brain** (Claude/Opus/GPT) handles planning, judgment, and final decisions.
-- **Workers** (DeepSeek, Mimo, Qwen, etc.) handle token-heavy, bounded tasks.
-- Communication is via structured **artifacts** (task.json → result.json).
-- Writable tasks run in **isolated git worktrees** with patch export.
+Communication is through files, not chat. Each task is an envelope
+(`task.json`) that produces a result package (`result.md` + `result.json`). No
+agent free-styling, no lost context, fully auditable.
+
+## What it does
+
+- **`explore`** — "where is X handled?" Find files, trace call chains, map
+  modules. Read-only.
+- **`review`** — review the current diff for bugs, regressions, missing tests.
+  Read-only.
+- **`log`** — point it at a failing test log, get back a root-cause hypothesis.
+  Read-only.
+- **`implement`** — make a small bounded change in an **isolated git worktree**,
+  hand back a patch you review before applying.
+- **`test-fix`** — fix failing tests in a worktree (production code first, never
+  deletes tests).
+
+A few things that matter for trust:
+
+- **Workers are engine-permissioned, not just prompt-constrained.** Read-only
+  workers get `edit: deny` at the OpenCode layer — they physically can't write,
+  regardless of what the prompt says. Check it: `opencode agent list`.
+- **Writable tasks are isolated.** They run in a fresh git worktree and only
+  produce a patch. Nothing is auto-merged.
+- **Two model tiers.** Speed jobs (`explore`, `log`) run on a fast model;
+  judgment jobs (`review`, `implement`, `test-fix`) run on a quality model.
+  First run auto-detects what you've authed and picks sensible defaults — then
+  you confirm.
 
 ## Install
 
-This repo follows the [`skill`](https://www.npmjs.com/package/skill) CLI layout — the
-skill lives under `skills/opencode-sidecar/`. Install it into a project with:
-
 ```bash
-SKILL_BASE_URL=https://github.com/<your-org>/<this-repo>/tree/main \
+SKILL_BASE_URL=https://github.com/edisoncgh/opencode-sidecar-skill/tree/main \
   npx skill skills/opencode-sidecar
 ```
 
-This downloads `skills/opencode-sidecar/` into the project's local skills directory
-(`.codebuddy/skills/opencode-sidecar/`, or `.claude/skills/opencode-sidecar/` for Claude Code).
+Drops the skill into `.codebuddy/skills/opencode-sidecar/`
+(or `.claude/skills/opencode-sidecar/` for Claude Code).
 
-## Quick Start
-
-Run the orchestrator from inside the installed skill directory (paths are relative to the skill root):
+## First run: pick your models
 
 ```bash
-# Explore a codebase
-python scripts/sidecar.py explore \
-  --goal "Find where user authentication is handled."
-
-# Review current changes
-python scripts/sidecar.py review \
-  --scope "Current git diff"
-
-# Analyze a log file
-python scripts/sidecar.py log \
-  --log-file "test-failure.log" \
-  --goal "Identify the root cause."
-
-# Implement in isolated worktree
-python scripts/sidecar.py implement \
-  --goal "Add null guard for user.location." \
-  --worktree
-
-# Detect file overlaps between parallel worktree patches
-python scripts/sidecar.py check-conflicts
+cd skills/opencode-sidecar
+python scripts/sidecar.py init
 ```
 
-## Architecture
-
-```
-Claude Code Main Agent
-    │
-    ├── Generates task envelope
-    ├── Calls sidecar.py
-    │
-    └── .agent_sidecars/tasks/<task-id>/
-        ├── task.json          # Structured task definition
-        ├── task.md            # Human-readable task description
-        ├── result.json        # Structured result
-        ├── result.md          # Human-readable result
-        ├── stdout.log         # Full worker output (streamed to disk)
-        ├── stderr.log         # Error output
-        ├── metadata.json      # Execution metadata
-        └── patch.diff         # (writable tasks) Git diff
-```
-
-## Worker Modes
-
-The worker role and its constraints are embedded directly in the task prompt sent to
-OpenCode (no custom OpenCode agent registration required).
-
-| Mode | Role | Access |
-|------|------|--------|
-| `explore` | Codebase exploration — find files, trace call chains, map modules | Read-only |
-| `review` | Code review — bugs, regressions, missing tests | Read-only |
-| `log` | Log / test-failure analysis — root-cause hypotheses | Read-only |
-| `implement` | Implement small bounded changes | Worktree-writable |
-| `test-fix` | Fix failing tests | Worktree-writable |
-
-## Configuration
-
-Set environment variables to customize model selection:
+This probes `opencode` for what you've authed and what models exist, then prints
+an auto-guessed fast/quality split. The main agent (you, or Claude guided by
+SKILL.md) recommends a pair, you pick, then:
 
 ```bash
-export OPENCODE_SIDECAR_DEFAULT_MODEL=deepseek/deepseek-chat
-export OPENCODE_SIDECAR_EXPLORE_MODEL=deepseek/deepseek-chat
-export OPENCODE_SIDECAR_IMPLEMENT_MODEL=mimo/mimo-pro
+python scripts/sidecar.py config set \
+  --fast "deepseek/deepseek-v4-flash" \
+  --quality "deepseek/deepseek-v4-pro"
 ```
 
-## Repository Layout
+That's it. Written to `.opencode-sidecar.json` (gitignored — it's machine-local).
+If you skip this, the first task auto-detects and writes it for you.
 
-```
-<repo-root>/
-├── README.md                          # This file (project-level)
-├── design.md                          # Full specification
-└── skills/
-    └── opencode-sidecar/              # The installable skill
-        ├── SKILL.md                   # Skill instructions
-        ├── README.zh-CN.md            # 中文文档
-        ├── scripts/
-        │   └── sidecar.py             # Main orchestrator
-        ├── templates/                 # Task / result templates
-        ├── schemas/                   # task & result JSON schemas
-        └── opencode/agents/           # OpenCode worker agent definitions
+## Use it
+
+```bash
+python scripts/sidecar.py explore --goal "Find where auth tokens are validated."
+python scripts/sidecar.py review  --scope "Current git diff"
+python scripts/sidecar.py log     --log-file crash.log --goal "Root cause."
+python scripts/sidecar.py implement --goal "Add null guard for user.location." --worktree
+python scripts/sidecar.py check-conflicts   # if you ran several implement tasks in parallel
+python scripts/sidecar.py list              # see all tasks
+python scripts/sidecar.py collect --task-id 2026-06-15-001   # pull a task's results
 ```
 
-## Implementation Status
+Each task lands in `.agent_sidecars/tasks/<id>/` with `result.md`, `result.json`,
+`metadata.json`, and (for writable tasks) `patch.diff`. **The main agent must
+review findings/patches before acting** — that's the whole point of the split.
 
-### Phase 1 — MVP Read-Only Workers
-- [x] `explore`, `review`, `log` commands
-- [x] Structured task/result artifacts
-- [x] stdout/stderr streamed to disk (preserved on timeout)
-- [x] Metadata generation and error handling
+## How it works (briefly)
 
-### Phase 2 — Writable Workers + Worktree
-- [x] `implement` / `test-fix` with `--worktree`
-- [x] Automatic worktree creation and patch export
-- [x] Sensitive-file detection
-- [x] Atomic task-id claim (parallel-safe) + `check-conflicts`
-- [x] Process-tree kill on timeout (no orphaned workers)
+```
+skills/opencode-sidecar/
+├── SKILL.md              what the main agent reads to drive the skill
+├── scripts/sidecar.py    the orchestrator (probe, dispatch, collect)
+├── opencode/agents/      5 subagent defs with engine-enforced permissions
+├── templates/            task envelope + result contract templates
+└── schemas/              task.json / result.json JSON schemas
+```
 
-### Phase 3 — Server Attach (Planned)
-- [ ] Connect to running `opencode serve`, fallback to CLI
+`sidecar.py` is the only moving part. For each task it: claims a unique id
+(atomically, so parallel tasks can't collide), writes a task envelope, syncs the
+subagent into the project's `.opencode/agents/`, runs `opencode run --agent
+<name>`, streams output to disk (so a timeout still preserves partial results),
+kills the whole process tree on timeout (no orphaned workers burning tokens),
+and emits a structured result. Writable tasks add a worktree + patch export on
+top. That's it — no server, no queue, no dashboard.
 
-### Phase 4 — HTTP API (Future)
-- [ ] Direct API calls, concurrent workers, task queue
-
-## References
-
-- [Design Document](design.md) — Full specification
-- [OpenCode](https://github.com/opencode-ai/opencode) — Worker runtime
-- [`skill` CLI](https://www.npmjs.com/package/skill) — Installer
+> 中文文档:[README.zh-CN.md](skills/opencode-sidecar/README.zh-CN.md) ·
+> Full spec:[design.md](design.md) (in `.gitignore`, dev-only)

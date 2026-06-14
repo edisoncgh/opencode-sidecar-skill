@@ -73,6 +73,18 @@ WORKER_MAP = {
     "test-fix": "worktree-worker",
 }
 
+# Maps each mode to the OpenCode subagent name. The agent name equals the
+# markdown file name (without .md) under opencode/agents/. These agents carry
+# engine-enforced permissions (read-only vs. worktree-writable), so the worker
+# is constrained by OpenCode itself, not only by prompt instructions.
+AGENT_MAP = {
+    "explore": "sidecar-explorer",
+    "review": "sidecar-reviewer",
+    "log": "sidecar-log-analyst",
+    "implement": "sidecar-implementer",
+    "test-fix": "sidecar-test-fixer",
+}
+
 TEMPLATE_MAP = {
     "explore": "task_explore.md",
     "review": "task_review.md",
@@ -89,21 +101,18 @@ DEFAULT_TIMEOUT = {
     "test-fix": 600,
 }
 
-DEFAULT_MODEL = {
-    "explore": "deepseek/deepseek-chat",
-    "review": "deepseek/deepseek-chat",
-    "log": "deepseek/deepseek-chat",
-    "implement": "deepseek/deepseek-chat",
-    "test-fix": "deepseek/deepseek-chat",
-}
+# Two-tier model routing. Modes map to one of two tiers based on whether the
+# task is read-heavy/speed-sensitive (fast) or judgment/write-heavy (quality).
+FAST_MODES = {"explore", "log"}
+QUALITY_MODES = {"review", "implement", "test-fix"}
+MODE_TIERS = {m: "fast" for m in FAST_MODES}
+MODE_TIERS.update({m: "quality" for m in QUALITY_MODES})
 
-ENV_MODEL_MAP = {
-    "explore": "OPENCODE_SIDECAR_EXPLORE_MODEL",
-    "review": "OPENCODE_SIDECAR_REVIEW_MODEL",
-    "log": "OPENCODE_SIDECAR_LOG_MODEL",
-    "implement": "OPENCODE_SIDECAR_IMPLEMENT_MODEL",
-    "test-fix": "OPENCODE_SIDECAR_TEST_FIX_MODEL",
-}
+CONFIG_FILENAME = ".opencode-sidecar.json"
+
+# Env vars to override each tier (optional, one level above the config file).
+ENV_FAST_MODEL = "OPENCODE_SIDECAR_FAST_MODEL"
+ENV_QUALITY_MODEL = "OPENCODE_SIDECAR_QUALITY_MODEL"
 
 SENSITIVE_FILES = [
     ".env", ".env.",
@@ -159,19 +168,178 @@ def generate_task_id() -> str:
     raise RuntimeError("Could not allocate a unique task id after 1000 attempts.")
 
 
-def resolve_model(mode: str, cli_model: str | None = None) -> str:
-    """Resolve model from CLI arg, environment variable, or default."""
+def get_config_path(project_dir: Path) -> Path:
+    """Path to the per-project sidecar model config."""
+    return project_dir / CONFIG_FILENAME
+
+
+def read_config(project_dir: Path) -> dict | None:
+    """Read the per-project model config, or None if not configured."""
+    return read_json(get_config_path(project_dir))
+
+
+def write_config(project_dir: Path, fast_model: str, quality_model: str) -> Path:
+    """Write the per-project model config. Returns the config path."""
+    path = get_config_path(project_dir)
+    data = {
+        "fast_model": fast_model,
+        "quality_model": quality_model,
+        "configured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return path
+
+
+# Keyword scoring for auto-detecting which authed model is "fast" vs "quality".
+# Higher score = stronger signal for that tier. Used only as a first-run
+# fallback guess; the user confirms via `sidecar.py init`.
+_FAST_SIGNALS = ["flash", "mini", "lite", "haiku", "nano", "small", "instant", "turbo"]
+_QUALITY_SIGNALS = ["pro", "max", "ultra", "opus", "reasoning", "thinking", "o1", "r1"]
+
+
+def _score_model(model_id: str) -> tuple[int, int]:
+    """Return (fast_score, quality_score) for a model id."""
+    low = model_id.lower()
+    fast = sum(2 for s in _FAST_SIGNALS if s in low)
+    quality = sum(2 for s in _QUALITY_SIGNALS if s in low)
+    return fast, quality
+
+
+def detect_available_models() -> tuple[list[str], list[str]]:
+    """Probe opencode for (all known model ids, authed provider display names).
+
+    Runs `opencode models` and `opencode providers list`. Returns two lists.
+    Either may be empty if the commands fail.
+    """
+    def _run(args: list[str]) -> str:
+        try:
+            r = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            return r.stdout if r.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    models_out = _run([get_opencode_path() or "opencode", "models"])
+    providers_out = _run([get_opencode_path() or "opencode", "providers", "list"])
+
+    model_ids: list[str] = []
+    for line in models_out.splitlines():
+        line = line.strip()
+        # model ids look like provider/model or provider/sub/model
+        if "/" in line and not line.startswith("opencode ") and " " not in line:
+            model_ids.append(line)
+
+    authed_names: list[str] = []
+    for line in providers_out.splitlines():
+        # strip ANSI escape codes first
+        clean_line = _strip_ansi(line)
+        # authed providers appear as "<bullet>  Name api" where bullet is
+        # U+2022 (•) or U+25CF (●)
+        has_bullet = any(b in clean_line for b in ("•", "●"))
+        if has_bullet and "api" in clean_line:
+            name = clean_line
+            for b in ("•", "●"):
+                name = name.replace(b, "")
+            name = name.strip()
+            name = name.rsplit("api", 1)[0].strip()
+            if name:
+                authed_names.append(name)
+
+    return model_ids, authed_names
+
+
+_ANSI_RE = None
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences (colors, cursor moves) from text."""
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    return _ANSI_RE.sub("", text)
+
+
+def auto_pick_models() -> tuple[str | None, str | None]:
+    """Pick a fast and a quality model from what opencode reports available.
+
+    Heuristic: score every model id by keyword signals. The highest-scoring
+    model wins each tier. Returns (fast, quality); either may be None if
+    detection yields nothing.
+    """
+    model_ids, _authed = detect_available_models()
+    if not model_ids:
+        return None, None
+
+    best_fast: tuple[int, str] | None = None
+    best_quality: tuple[int, str] | None = None
+    for mid in model_ids:
+        f, q = _score_model(mid)
+        if f > 0 and (best_fast is None or f > best_fast[0]):
+            best_fast = (f, mid)
+        if q > 0 and (best_quality is None or q > best_quality[0]):
+            best_quality = (q, mid)
+
+    fast = best_fast[1] if best_fast else None
+    quality = best_quality[1] if best_quality else None
+    # If only one tier got a match, fall back to the other
+    if fast and not quality:
+        quality = fast
+    if quality and not fast:
+        fast = quality
+    return fast, quality
+
+
+def resolve_model(mode: str, project_dir: Path, cli_model: str | None = None) -> str:
+    """Resolve the model id for a task mode.
+
+    Priority: CLI --model > tier env var > project config file > auto-detect.
+
+    On first run with no config, this auto-detects from opencode's authed
+    models, writes the config (so subsequent runs are stable), and prints a
+    notice to stderr recommending `sidecar.py init` to confirm or change it.
+    """
     if cli_model:
         return cli_model
-    env_var = ENV_MODEL_MAP.get(mode)
-    if env_var:
-        env_model = os.environ.get(env_var)
-        if env_model:
-            return env_model
-    default_model = os.environ.get("OPENCODE_SIDECAR_DEFAULT_MODEL")
-    if default_model:
-        return default_model
-    return DEFAULT_MODEL.get(mode, "deepseek/deepseek-chat")
+
+    tier = MODE_TIERS.get(mode, "fast")
+    env_var = ENV_FAST_MODEL if tier == "fast" else ENV_QUALITY_MODEL
+    env_model = os.environ.get(env_var)
+    if env_model:
+        return env_model
+
+    config = read_config(project_dir)
+    if config:
+        key = "fast_model" if tier == "fast" else "quality_model"
+        configured = config.get(key)
+        if configured:
+            return configured
+
+    # No config yet — auto-detect once and persist.
+    fast, quality = auto_pick_models()
+    chosen = fast if tier == "fast" else quality
+    if not chosen:
+        raise RuntimeError(
+            "Could not auto-detect an opencode model for this task, and no "
+            "model config exists. Run `sidecar.py init` to configure, or pass "
+            "--model <provider/model> explicitly."
+        )
+    # Persist whatever we detected (filling the other tier if missing) so the
+    # next run is stable and so the user can inspect/edit the file.
+    write_config(project_dir, fast or chosen, quality or chosen)
+    print(
+        f"[sidecar] No model config found. Auto-detected and wrote "
+        f"{CONFIG_FILENAME}: fast={fast or chosen}, quality={quality or chosen}. "
+        f"Run `sidecar.py init` to review or change.",
+        file=sys.stderr,
+    )
+    return chosen
 
 
 def parse_patch_files(patch_text: str) -> set[str]:
@@ -203,6 +371,11 @@ def get_skill_dir() -> Path:
 def get_templates_dir() -> Path:
     """Get the templates directory."""
     return get_skill_dir() / "templates"
+
+
+def get_skill_agents_dir() -> Path:
+    """Get the directory holding the bundled OpenCode subagent definitions."""
+    return get_skill_dir() / "opencode" / "agents"
 
 
 def check_git_repo(project_dir: Path) -> bool:
@@ -408,6 +581,29 @@ class SidecarOrchestrator:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
 
+    def sync_agents(self) -> list[str]:
+        """Copy bundled sidecar subagent definitions into the project's
+        .opencode/agents/ so OpenCode loads them with engine-enforced
+        permissions.
+
+        OpenCode discovers agents by walking up from the working directory to
+        find a .opencode/agents/ folder, so placing them at the project root
+        covers both read-only tasks (run at the project root) and writable
+        tasks (run inside a worktree nested under the project). Only the
+        sidecar-*.md files are written; any user-authored agents are left
+        untouched. Returns the list of agent names made available.
+        """
+        src_dir = get_skill_agents_dir()
+        dst_dir = self.project_dir / ".opencode" / "agents"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        synced = []
+        for agent_name in AGENT_MAP.values():
+            src = src_dir / f"{agent_name}.md"
+            if src.exists():
+                shutil.copyfile(src, dst_dir / f"{agent_name}.md")
+                synced.append(agent_name)
+        return synced
+
     def get_task_dir(self, task_id: str) -> Path:
         """Get the directory for a specific task."""
         return self.tasks_dir / task_id
@@ -468,6 +664,8 @@ class SidecarOrchestrator:
     def run_task(self, task_config: TaskConfig) -> dict:
         """Execute a sidecar task and return results."""
         self.ensure_dirs()
+        # Make the engine-permissioned subagents available to OpenCode.
+        synced_agents = self.sync_agents()
         task_dir = self.get_task_dir(task_config.task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -541,6 +739,7 @@ class SidecarOrchestrator:
             "mode": task_config.mode,
             "worker": task_config.worker,
             "model": task_config.model,
+            "agent": AGENT_MAP.get(task_config.mode),
             "status": task_config.status,
             "returncode": returncode,
             "timeout": task_config.timeout,
@@ -645,13 +844,20 @@ class SidecarOrchestrator:
         # Model
         cmd.extend(["--model", task_config.model])
 
+        # Agent — selects the engine-permissioned subagent for this mode.
+        # The agent enforces read-only vs. writable access at the OpenCode
+        # layer; the prompt constraints below are a secondary guard.
+        agent_name = AGENT_MAP.get(task_config.mode)
+        if agent_name:
+            cmd.extend(["--agent", agent_name])
+
         # Format
         cmd.extend(["--format", "json"])
 
         # Title
         cmd.extend(["--title", f"sidecar-{task_config.task_id}"])
 
-        # Message - the task prompt (role embedded, no --agent needed)
+        # Message - the task prompt (role enforced by --agent; prompt reinforces)
         prompt = self._build_prompt(task_config)
         cmd.append(prompt)
 
@@ -903,7 +1109,7 @@ class SidecarOrchestrator:
 
 def cmd_explore(args, orchestrator: SidecarOrchestrator) -> None:
     """Run an exploration task."""
-    model = resolve_model("explore", args.model)
+    model = resolve_model("explore", orchestrator.project_dir, args.model)
     config = TaskConfig(
         mode="explore",
         goal=args.goal,
@@ -917,7 +1123,7 @@ def cmd_explore(args, orchestrator: SidecarOrchestrator) -> None:
 
 def cmd_review(args, orchestrator: SidecarOrchestrator) -> None:
     """Run a review task."""
-    model = resolve_model("review", args.model)
+    model = resolve_model("review", orchestrator.project_dir, args.model)
     config = TaskConfig(
         mode="review",
         goal=args.goal or "Review the current git diff for correctness and missing tests.",
@@ -932,7 +1138,7 @@ def cmd_review(args, orchestrator: SidecarOrchestrator) -> None:
 
 def cmd_log(args, orchestrator: SidecarOrchestrator) -> None:
     """Run a log analysis task."""
-    model = resolve_model("log", args.model)
+    model = resolve_model("log", orchestrator.project_dir, args.model)
     config = TaskConfig(
         mode="log",
         goal=args.goal,
@@ -947,7 +1153,7 @@ def cmd_log(args, orchestrator: SidecarOrchestrator) -> None:
 
 def cmd_implement(args, orchestrator: SidecarOrchestrator) -> None:
     """Run an implementation task in an isolated worktree."""
-    model = resolve_model("implement", args.model)
+    model = resolve_model("implement", orchestrator.project_dir, args.model)
     config = TaskConfig(
         mode="implement",
         goal=args.goal,
@@ -962,7 +1168,7 @@ def cmd_implement(args, orchestrator: SidecarOrchestrator) -> None:
 
 def cmd_test_fix(args, orchestrator: SidecarOrchestrator) -> None:
     """Run a test fix task in an isolated worktree."""
-    model = resolve_model("test-fix", args.model)
+    model = resolve_model("test-fix", orchestrator.project_dir, args.model)
     config = TaskConfig(
         mode="test-fix",
         goal=args.goal,
@@ -1102,6 +1308,85 @@ def cmd_check_conflicts(args, orchestrator: SidecarOrchestrator) -> None:
             print(f"      <- {task_id}")
 
 
+def cmd_init(args, orchestrator: SidecarOrchestrator) -> None:
+    """Onboarding: probe available models and print guidance.
+
+    This is the deterministic half of the onboarding flow. It surfaces what
+    opencode has authed and what models exist, plus an auto-detected guess for
+    fast/quality tiers. The main agent (guided by SKILL.md) uses this output
+    to recommend models to the user, then calls `config set` to persist.
+    """
+    print(f"Project config path: {get_config_path(orchestrator.project_dir)}")
+    existing = read_config(orchestrator.project_dir)
+    if existing:
+        print(f"Current config: fast={existing.get('fast_model')} "
+              f"quality={existing.get('quality_model')} "
+              f"(configured {existing.get('configured_at', '?')})")
+        print()
+    else:
+        print("No config yet. Run `config set` after picking models below.\n")
+
+    model_ids, authed_names = detect_available_models()
+    print(f"Authed providers ({len(authed_names)}):")
+    for n in authed_names:
+        print(f"  - {n}")
+    print()
+
+    print(f"Available models ({len(model_ids)}):")
+    for mid in sorted(model_ids):
+        f, q = _score_model(mid)
+        tag = ""
+        if q >= 2 and q >= f:
+            tag = "  [quality-ish]"
+        elif f >= 2 and f > q:
+            tag = "  [fast-ish]"
+        print(f"  {mid}{tag}")
+
+    fast, quality = auto_pick_models()
+    print()
+    print("Auto-detected guess:")
+    print(f"  fast    = {fast or '(none matched)'}")
+    print(f"  quality = {quality or '(none matched)'}")
+    print()
+    print("To configure, run:")
+    print("  python scripts/sidecar.py config set "
+          f"--fast \"{fast or '<model>'}\" --quality \"{quality or '<model>'}\"")
+    print("\nThen review: python scripts/sidecar.py config show")
+
+
+def cmd_config_show(args, orchestrator: SidecarOrchestrator) -> None:
+    """Show the current model config."""
+    path = get_config_path(orchestrator.project_dir)
+    config = read_config(orchestrator.project_dir)
+    if not config:
+        print(f"No config at {path}.")
+        print("Run `init` to detect models, then `config set` to configure.")
+        return
+    print(f"Config: {path}")
+    print(json.dumps(config, indent=2, ensure_ascii=False))
+    print()
+    print("Mode routing:")
+    for mode in ("explore", "log"):
+        print(f"  {mode:10} -> fast    -> {config.get('fast_model')}")
+    for mode in ("review", "implement", "test-fix"):
+        print(f"  {mode:10} -> quality -> {config.get('quality_model')}")
+
+
+def cmd_config_set(args, orchestrator: SidecarOrchestrator) -> None:
+    """Persist the fast/quality model choice to the project config."""
+    if not args.fast or not args.quality:
+        print("ERROR: both --fast and --quality are required.", file=sys.stderr)
+        sys.exit(1)
+    path = write_config(orchestrator.project_dir, args.fast, args.quality)
+    print(f"Config written: {path}")
+    print(f"  fast    = {args.fast}")
+    print(f"  quality = {args.quality}")
+    print()
+    print("Mode routing:")
+    print(f"  explore, log          -> fast    -> {args.fast}")
+    print(f"  review, implement, test-fix -> quality -> {args.quality}")
+
+
 # ── Output ─────────────────────────────────────────────────────────────────
 
 def print_result(result: dict) -> None:
@@ -1192,6 +1477,20 @@ def main():
         help="Detect file overlaps between worktree task patches",
     )
 
+    # init — onboarding: probe models and print guidance
+    subparsers.add_parser(
+        "init",
+        help="Probe available opencode models and print onboarding guidance",
+    )
+
+    # config — show / set the project model config
+    p_config = subparsers.add_parser("config", help="Manage model config")
+    config_sub = p_config.add_subparsers(dest="config_command")
+    config_sub.add_parser("show", help="Show current model config")
+    p_config_set = config_sub.add_parser("set", help="Set fast/quality models")
+    p_config_set.add_argument("--fast", required=True, help="Model id for fast tier")
+    p_config_set.add_argument("--quality", required=True, help="Model id for quality tier")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1207,7 +1506,9 @@ def main():
         print("Please run this command from within a git repository.", file=sys.stderr)
         sys.exit(1)
 
-    if args.command not in ("collect", "list", "cleanup", "check-conflicts"):
+    # Commands that don't invoke opencode: don't require it installed.
+    no_opencode_commands = ("collect", "list", "cleanup", "check-conflicts", "config")
+    if args.command not in no_opencode_commands:
         if not check_opencode_available():
             print("ERROR: opencode command not found.", file=sys.stderr)
             print("Please install OpenCode: https://github.com/opencode-ai/opencode", file=sys.stderr)
@@ -1226,9 +1527,19 @@ def main():
         "list": cmd_list,
         "cleanup": cmd_cleanup,
         "check-conflicts": cmd_check_conflicts,
+        "init": cmd_init,
     }
 
-    commands[args.command](args, orchestrator)
+    if args.command == "config":
+        if not args.config_command:
+            p_config.print_help()
+            sys.exit(1)
+        if args.config_command == "show":
+            cmd_config_show(args, orchestrator)
+        elif args.config_command == "set":
+            cmd_config_set(args, orchestrator)
+    else:
+        commands[args.command](args, orchestrator)
 
 
 if __name__ == "__main__":

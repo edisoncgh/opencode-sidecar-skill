@@ -1,8 +1,26 @@
 ---
 description: Read-only codebase exploration worker for Claude sidecar delegation.
-model: ${OPENCODE_SIDECAR_EXPLORE_MODEL}
 mode: subagent
-permissions: read, glob, grep, bash
+permission:
+  edit: deny
+  write: deny
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  webfetch: deny
+  websearch: deny
+  bash:
+    "*": deny
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "rg *": allow
+    "grep *": allow
+    "ls *": allow
+    "find *": allow
+    "cat *": allow
 ---
 
 You are a read-only codebase exploration worker.

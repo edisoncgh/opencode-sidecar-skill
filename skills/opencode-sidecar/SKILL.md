@@ -112,31 +112,72 @@ Inspect the result files:
 
 The main agent must verify all findings before acting.
 
-## Environment Variables
+## Model Routing (two tiers)
 
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `OPENCODE_SIDECAR_DEFAULT_MODEL` | Default model for all workers | `deepseek/deepseek-chat` |
-| `OPENCODE_SIDECAR_EXPLORE_MODEL` | Model for exploration workers | (uses default) |
-| `OPENCODE_SIDECAR_REVIEW_MODEL` | Model for review workers | (uses default) |
-| `OPENCODE_SIDECAR_LOG_MODEL` | Model for log analysis workers | (uses default) |
-| `OPENCODE_SIDECAR_IMPLEMENT_MODEL` | Model for implementation workers | (uses default) |
-| `OPENCODE_SIDECAR_TEST_FIX_MODEL` | Model for test fix workers | (uses default) |
+Tasks split into two tiers by what they need:
 
-## Worker Roles
+| Tier | Modes | Why |
+|------|-------|-----|
+| **fast** | `explore`, `log` | Read-heavy (find files, scan logs); speed over judgment |
+| **quality** | `review`, `implement`, `test-fix` | Find bugs / write code / fix tests; wrong output is costly |
 
-Each mode maps to a worker role. The role and its constraints (read-only vs.
-worktree-writable, forbidden actions) are embedded directly in the task prompt
-sent to OpenCode, so the workers do not depend on custom OpenCode agent
-registration.
+The model for each tier is resolved in this priority:
 
-| Mode | Role | Access |
-|------|------|--------|
-| `explore` | Codebase exploration | Read-only |
-| `review` | Code review | Read-only |
-| `log` | Log / test failure analysis | Read-only |
-| `implement` | Implementation | Worktree-writable |
-| `test-fix` | Test fixing | Worktree-writable |
+1. CLI `--model <id>` (per-task override)
+2. Env var: `OPENCODE_SIDECAR_FAST_MODEL` / `OPENCODE_SIDECAR_QUALITY_MODEL`
+3. Project config file `.opencode-sidecar.json`
+4. **Auto-detect on first run** — probes `opencode models` + `opencode providers list`,
+   keyword-scores models, picks one fast + one quality, and writes the config. A
+   stderr notice points the user at `init` to confirm or change it.
+
+### Onboarding flow
+
+When the user first sets up the skill (or asks to configure it), guide them through:
+
+```bash
+# 1. Probe what's authed and what models exist, with an auto-guessed split:
+python scripts/sidecar.py init
+
+# 2. Recommend a fast + quality model based on the output (use your model
+#    knowledge + the authed providers), then let the user pick.
+
+# 3. Persist the choice:
+python scripts/sidecar.py config set \
+  --fast "deepseek/deepseek-v4-flash" \
+  --quality "deepseek/deepseek-v4-pro"
+
+# 4. Verify:
+python scripts/sidecar.py config show
+```
+
+`init` is the deterministic half (probe + display). The recommendation itself is
+the main agent's job — reason about which authed model suits "fast" vs "quality"
+from the listed ids and provider names, and ask the user to confirm.
+
+## Worker Roles & Engine-Enforced Permissions
+
+Each mode maps to a dedicated OpenCode **subagent** (defined under
+`opencode/agents/`). On the first task run, `sidecar.py` syncs these agent
+definitions into the project's `.opencode/agents/` and invokes the worker with
+`opencode run --agent <name>`. OpenCode then enforces the agent's permissions at
+the engine level — a read-only worker physically cannot edit files, regardless
+of what the prompt says. The prompt constraints are a secondary guard, not the
+primary one.
+
+| Mode | Subagent | Access | Engine permissions |
+|------|----------|--------|--------------------|
+| `explore` | `sidecar-explorer` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
+| `review` | `sidecar-reviewer` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
+| `log` | `sidecar-log-analyst` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
+| `implement` | `sidecar-implementer` | Worktree-writable | `edit`/`write` allowed; `git commit`/`push`, installs, `rm -rf` denied |
+| `test-fix` | `sidecar-test-fixer` | Worktree-writable | `edit`/`write` allowed; `git commit`/`push`, installs, `rm -rf` denied |
+
+OpenCode discovers agents by walking up from the working directory to find a
+`.opencode/agents/` folder, so the synced agents apply both to read-only tasks
+(run at the project root) and writable tasks (run inside a nested worktree).
+Only `sidecar-*.md` files are written — user-authored agents are left untouched.
+
+To verify the loaded permissions yourself: `opencode agent list`.
 
 ## Error Handling
 

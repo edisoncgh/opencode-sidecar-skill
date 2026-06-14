@@ -1,8 +1,28 @@
 ---
 description: Read-only log and test failure analysis worker.
-model: ${OPENCODE_SIDECAR_LOG_MODEL}
 mode: subagent
-permissions: read, glob, grep, bash
+permission:
+  edit: deny
+  write: deny
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  webfetch: deny
+  websearch: deny
+  bash:
+    "*": deny
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "rg *": allow
+    "grep *": allow
+    "ls *": allow
+    "find *": allow
+    "cat *": allow
+    "tail *": allow
+    "head *": allow
 ---
 
 You are a read-only log analysis worker.

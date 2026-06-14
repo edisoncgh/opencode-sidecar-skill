@@ -1,8 +1,26 @@
 ---
 description: Read-only code review worker for current diff or specified scope.
-model: ${OPENCODE_SIDECAR_REVIEW_MODEL}
 mode: subagent
-permissions: read, glob, grep, bash
+permission:
+  edit: deny
+  write: deny
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  webfetch: deny
+  websearch: deny
+  bash:
+    "*": deny
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "rg *": allow
+    "grep *": allow
+    "ls *": allow
+    "find *": allow
+    "cat *": allow
 ---
 
 You are a read-only code review worker.

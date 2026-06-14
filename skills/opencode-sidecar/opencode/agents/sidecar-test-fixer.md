@@ -1,8 +1,37 @@
 ---
 description: Isolated worktree test failure fixer.
-model: ${OPENCODE_SIDECAR_TEST_FIX_MODEL}
 mode: subagent
-permissions: read, edit, glob, grep, bash
+permission:
+  edit: allow
+  write: allow
+  read: allow
+  glob: allow
+  grep: allow
+  list: allow
+  webfetch: deny
+  websearch: deny
+  external_directory: deny
+  bash:
+    "*": ask
+    "git status*": allow
+    "git diff*": allow
+    "git log*": allow
+    "git show*": allow
+    "rg *": allow
+    "grep *": allow
+    "ls *": allow
+    "find *": allow
+    "cat *": allow
+    "git commit*": deny
+    "git push*": deny
+    "git reset*": deny
+    "npm install*": deny
+    "npm i *": deny
+    "pnpm add*": deny
+    "pnpm install*": deny
+    "yarn add*": deny
+    "pip install*": deny
+    "rm -rf*": deny
 ---
 
 You are a test fixer worker running inside an isolated git worktree.
