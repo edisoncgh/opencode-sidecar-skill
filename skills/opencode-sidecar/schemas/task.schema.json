@@ -36,12 +36,13 @@
     "worker": {
       "type": "string",
       "enum": [
-        "code-explorer",
-        "git-diff-reviewer",
-        "log-failure-analyzer",
-        "worktree-worker"
+        "sidecar-explorer",
+        "sidecar-reviewer",
+        "sidecar-log-analyst",
+        "sidecar-implementer",
+        "sidecar-test-fixer"
       ],
-      "description": "Worker agent type"
+      "description": "Worker agent name (matches the opencode/agents/*.md file name)"
     },
     "model": {
       "type": "string",
