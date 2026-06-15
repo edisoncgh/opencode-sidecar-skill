@@ -11,3 +11,7 @@ __pycache__/
 design.md
 nul
 opencode-sidecar-bug-report-*.md
+
+# Local-only: project memory + handoff docs (not committed)
+.memory/
+docs/
