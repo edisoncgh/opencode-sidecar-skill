@@ -138,7 +138,45 @@ def test_readonly_modes_do_not_force_worktree():
             assert tc.worktree is False, f"{mode} should not force worktree"
 
 
-# ── 5. Index upsert ────────────────────────────────────────────────────────
+# ── 5. Lost-write fact-check ───────────────────────────────────────────────
+
+def _tool_event(tool: str, status: str = "completed") -> str:
+    return json.dumps({"type": "tool_use", "part": {"type": "tool", "tool": tool,
+                                                     "state": {"status": status}}})
+
+
+def test_attempted_writes_detects_write_tool():
+    parsed = sidecar.parse_event_stream(_tool_event("write"))
+    assert sidecar.worker_attempted_writes(parsed) is True
+
+
+def test_attempted_writes_detects_mcp_tool():
+    # ctx_execute (an MCP tool, not a known built-in) counts as a write attempt.
+    parsed = sidecar.parse_event_stream(_tool_event("ctx_execute"))
+    assert sidecar.worker_attempted_writes(parsed) is True
+
+
+def test_attempted_writes_ignores_readonly_builtins():
+    stream = "\n".join([_tool_event("read"), _tool_event("bash"), _tool_event("grep")])
+    parsed = sidecar.parse_event_stream(stream)
+    assert sidecar.worker_attempted_writes(parsed) is False
+
+
+def test_claimed_changes_true_when_file_listed():
+    text = "**Summary:** done\n\n**Files Changed:**\n- hello.txt — new file\n\n**Tests Run:** none"
+    assert sidecar.worker_claimed_changes(text) is True
+
+
+def test_claimed_changes_false_when_none():
+    text = "**Summary:** nothing to do\n\n**Files Changed:**\n- None\n\n**Risks:** none"
+    assert sidecar.worker_claimed_changes(text) is False
+
+
+def test_claimed_changes_false_without_section():
+    assert sidecar.worker_claimed_changes("just some prose, no report") is False
+
+
+# ── 6. Index upsert ────────────────────────────────────────────────────────
 
 def test_index_upsert_single_row_across_status_changes():
     with tempfile.TemporaryDirectory() as d:

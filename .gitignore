@@ -10,3 +10,4 @@ __pycache__/
 .opencode-sidecar.json
 design.md
 nul
+opencode-sidecar-bug-report-*.md

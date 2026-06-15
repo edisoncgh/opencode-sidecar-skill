@@ -66,6 +66,11 @@ Your job:
 
 Rules:
 - Only edit files inside the current worktree.
+- Create and modify files ONLY with the write/edit tool. NEVER write files via a
+  code-execution or sandbox tool (e.g. running Node.js/Python to fs.writeFile) —
+  those run in a sandbox and do NOT persist to the worktree, so the change is
+  silently lost. If the edit tool is ever unavailable, STOP and report it as a
+  blocker instead of working around it.
 - Do not commit.
 - Do not push.
 - Do not install dependencies unless explicitly instructed.

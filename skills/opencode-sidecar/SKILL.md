@@ -123,6 +123,19 @@ Inspect the result files:
 
 The main agent must verify all findings before acting.
 
+### Status semantics for writable tasks
+
+A writable task (`implement` / `test-fix`) only reports `completed` when its
+changes actually reached the worktree. `sidecar.py` exports the full worktree
+diff — **including new files** (`git add -N` before `git diff`, so a created
+file is not silently dropped) — then fact-checks it: if the worker invoked a
+write tool or claimed file changes in its report but `patch.diff` is empty, the
+task is forced to `status: failed` with a CRITICAL warning rather than a
+misleading `completed`. This catches the case where the worker's edit was
+denied and it fell back to a non-persisting sandbox/exec tool (e.g. an MCP
+`ctx_execute`) whose writes never touch disk. So: trust `patch.diff` as the
+source of truth, not the worker's prose.
+
 ## Model Routing (two tiers)
 
 Tasks split into two tiers by what they need:

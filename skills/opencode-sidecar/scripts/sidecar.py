@@ -453,6 +453,8 @@ def check_git_repo(project_dir: Path) -> bool:
             cwd=project_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         return result.returncode == 0
@@ -478,6 +480,8 @@ def check_dirty_worktree(project_dir: Path) -> bool:
             cwd=project_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         return bool(result.stdout.strip())
@@ -641,6 +645,73 @@ def detect_agent_fallback(output: str) -> str | None:
             return "named agent not found"
         return "unspecified fallback"
     return None
+
+
+def worker_attempted_writes(parsed: dict) -> bool:
+    """True if the worker invoked any file-writing tool in the event stream.
+
+    Looks for `tool_use` events whose tool is a writer (write/edit/patch/
+    apply_patch) OR a non-built-in tool (an MCP tool such as context-mode's
+    `ctx_execute`, which a worker may misuse to "write" files into a sandbox
+    that never persists to the worktree). Built-in read-only tools (read, bash,
+    grep, glob, list, etc.) are ignored — they don't indicate a write attempt.
+
+    Used by the fact-check guard: if the worker attempted a write but the
+    worktree diff is empty, the write was lost (denied edit → sandbox fallback,
+    or a non-persisting tool) and the task must NOT be reported as completed.
+    """
+    writer_tools = {"write", "edit", "patch", "apply_patch", "multiedit"}
+    builtin_tools = {
+        "read", "bash", "grep", "glob", "list", "ls", "webfetch", "websearch",
+        "task", "todowrite", "todoread", "lsp", "skill", "question",
+    }
+    for event in parsed.get("events", []):
+        if event.get("type") != "tool_use":
+            continue
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        tool = part.get("tool")
+        if not isinstance(tool, str):
+            continue
+        name = tool.lower()
+        if name in writer_tools:
+            return True
+        # An MCP/custom tool (anything not a known built-in) — a worker that
+        # reaches for one to write files is the failure mode we must catch.
+        if name not in builtin_tools:
+            return True
+    return False
+
+
+def worker_claimed_changes(worker_text: str) -> bool:
+    """True if the worker's report claims it changed files.
+
+    Heuristic over the "Files Changed" section of the structured report: a
+    worker that says it created/modified files but produced an empty patch has
+    lost its work. Conservative — only fires when a file path is actually
+    listed, not on "None" / "No files changed".
+    """
+    if not worker_text:
+        return False
+    low = worker_text.lower()
+    idx = low.find("files changed")
+    if idx == -1:
+        return False
+    # Inspect the lines immediately following the heading.
+    section = worker_text[idx:idx + 600]
+    lines = [ln.strip(" -*\t") for ln in section.splitlines()[1:]]
+    for ln in lines:
+        if not ln:
+            continue
+        low_ln = ln.lower()
+        if low_ln.startswith(("none", "no files", "n/a", "(none)")):
+            return False
+        # A bullet that names a file (has an extension or a path separator).
+        if "." in ln or "/" in ln or "\\" in ln:
+            return True
+        # Stop at the next section heading.
+        if low_ln.endswith(":") or low_ln.startswith(("patch", "tests", "risks")):
+            break
+    return False
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -809,6 +880,8 @@ class SidecarOrchestrator:
                 cwd=self.project_dir,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
             )
             if result.returncode == 0:
@@ -831,6 +904,8 @@ class SidecarOrchestrator:
             cwd=self.project_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         return result.returncode == 0
@@ -926,21 +1001,47 @@ class SidecarOrchestrator:
             )
 
         # Export patch for writable tasks
+        write_lost = False
         if task_config.worktree and worktree_path and worktree_path.exists():
             self._export_patch(task_config.task_id, worktree_path, task_dir)
             self._export_files_changed(task_config.task_id, worktree_path, task_dir)
 
             # Check sensitive files in patch
             patch_path = task_dir / "patch.diff"
+            patch_nonempty = patch_path.exists() and patch_path.read_text(encoding="utf-8").strip()
             if patch_path.exists():
                 patch_content = patch_path.read_text(encoding="utf-8")
                 security_warnings.extend(check_sensitive_files(patch_content))
+
+            # Fact-check: the worker may report success while its writes never
+            # reached the worktree — e.g. its edit was denied and it fell back to
+            # a non-persisting sandbox tool (context-mode `ctx_execute`), which
+            # runs in a discarded FS. _export_patch already surfaces NEW files
+            # (git add -N), so an empty patch here means nothing actually landed.
+            # If the worker ATTEMPTED a write (writer/MCP tool) or CLAIMED file
+            # changes in its report, an empty patch is a lost-write failure, not
+            # a clean "no-op". Don't trust the worker's self-reported success.
+            if not patch_nonempty:
+                parsed_ev = parse_event_stream(stdout)
+                attempted = worker_attempted_writes(parsed_ev)
+                claimed = worker_claimed_changes(parsed_ev["text"])
+                if attempted or claimed:
+                    write_lost = True
+                    security_warnings.append(
+                        "CRITICAL: worker reported file changes but the worktree "
+                        "diff is empty — the writes did NOT persist. Likely the "
+                        "edit tool was denied and the worker used a non-persisting "
+                        "sandbox/exec tool (e.g. ctx_execute). Treating as failed."
+                    )
 
         # Determine status
         if returncode != 0:
             task_config.status = "failed"
         elif fallback:
             # Agent fell back to default → ran without engine permissions.
+            task_config.status = "failed"
+        elif write_lost:
+            # Worker claimed/attempted writes but nothing reached the worktree.
             task_config.status = "failed"
         elif not stdout.strip():
             task_config.status = "partial"
@@ -1317,13 +1418,33 @@ class SidecarOrchestrator:
         }
 
     def _export_patch(self, task_id: str, worktree_path: Path, task_dir: Path) -> None:
-        """Export git diff as patch from worktree."""
+        """Export the worktree's full diff (including NEW files) as patch.diff.
+
+        Plain `git diff` shows only changes to *tracked* files. A worker that
+        creates a new file (the common `implement` case) would otherwise yield
+        an empty diff and the change would be silently lost — the task reports
+        "completed" with nothing to apply. `git add -N .` records intent-to-add
+        for untracked files (respecting .gitignore), so new files appear in
+        `git diff` as additions without staging their content. The worktree is
+        disposable, so mutating its index here is harmless.
+
+        encoding="utf-8" is mandatory: the diff carries the worker's file
+        content, which is frequently non-ASCII. Without it the PIPE reader
+        thread decodes as the Windows locale (GBK) and crashes with
+        UnicodeDecodeError, losing the patch.
+        """
+        # Surface untracked (new) files so `git diff` includes them.
+        subprocess.run(
+            ["git", "add", "-N", "."],
+            cwd=str(worktree_path),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
+        )
         result = subprocess.run(
             ["git", "diff"],
             cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-            timeout=30,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
             (task_dir / "patch.diff").write_text(result.stdout, encoding="utf-8")
@@ -1338,6 +1459,8 @@ class SidecarOrchestrator:
             cwd=str(worktree_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         if result.returncode == 0:
