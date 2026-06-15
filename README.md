@@ -88,15 +88,17 @@ If you skip this, the first task auto-detects and writes it for you.
 python scripts/sidecar.py explore --goal "Find where auth tokens are validated."
 python scripts/sidecar.py review  --scope "Current git diff"
 python scripts/sidecar.py log     --log-file crash.log --goal "Root cause."
-python scripts/sidecar.py implement --goal "Add null guard for user.location." --worktree
+python scripts/sidecar.py implement --goal "Add null guard for user.location."
 python scripts/sidecar.py check-conflicts   # if you ran several implement tasks in parallel
 python scripts/sidecar.py list              # see all tasks
 python scripts/sidecar.py collect --task-id 2026-06-15-001   # pull a task's results
 ```
 
-Each task lands in `.agent_sidecars/tasks/<id>/` with `result.md`, `result.json`,
-`metadata.json`, and (for writable tasks) `patch.diff`. **The main agent must
-review findings/patches before acting** — that's the whole point of the split.
+Each task lands in `.agent_sidecars/tasks/<id>/`. The full envelope + result
+package is: `task.md`, `task.json`, `events.jsonl`, `worker_text.md`,
+`result.md`, `result.json`, and (for writable tasks) `patch.diff`. **The main
+agent must review findings/patches before acting** — that's the whole point of
+the split.
 
 ## How it works (briefly)
 
@@ -104,18 +106,25 @@ review findings/patches before acting** — that's the whole point of the split.
 skills/opencode-sidecar/
 ├── SKILL.md              what the main agent reads to drive the skill
 ├── scripts/sidecar.py    the orchestrator (probe, dispatch, collect)
-├── opencode/agents/      5 subagent defs with engine-enforced permissions
+├── opencode/agents/      5 worker agent definitions (mode: primary, engine-permissioned)
 ├── templates/            task envelope + result contract templates
 └── schemas/              task.json / result.json JSON schemas
 ```
 
-`sidecar.py` is the only moving part. For each task it: claims a unique id
-(atomically, so parallel tasks can't collide), writes a task envelope, syncs the
-subagent into the project's `.opencode/agents/`, runs `opencode run --agent
-<name>`, streams output to disk (so a timeout still preserves partial results),
-kills the whole process tree on timeout (no orphaned workers burning tokens),
-and emits a structured result. Writable tasks add a worktree + patch export on
-top. That's it — no server, no queue, no dashboard.
+`sidecar.py` is the only moving part. Worker agents are OpenCode **primary**
+agents (`mode: primary`) — in product terms they're sidecar workers, but inside
+OpenCode they're ordinary primary agents that `opencode run --agent <name>`
+starts directly. They load via the `OPENCODE_CONFIG_DIR` env var pointing at the
+bundled `opencode/` folder — nothing is copied into your project's
+`.opencode/agents/`, and your provider/auth config stays intact. For each task
+`sidecar.py`: claims a unique id atomically (so parallel tasks can't collide),
+writes a task envelope, runs `opencode run --agent <name> --format json`, parses
+the JSONL event stream into `events.jsonl` + `worker_text.md`, streams raw
+output to disk (so a timeout still preserves partial results), kills the whole
+process tree on timeout (no orphaned workers burning tokens), and emits a
+structured result. `implement`/`test-fix` always run inside an isolated git
+worktree and only produce a `patch.diff` — they never auto-merge, commit, or
+push. That's it — no server, no queue, no dashboard.
 
 > 中文文档:[README.zh-CN.md](skills/opencode-sidecar/README.zh-CN.md) ·
 > Full spec:[design.md](design.md) (in `.gitignore`, dev-only)

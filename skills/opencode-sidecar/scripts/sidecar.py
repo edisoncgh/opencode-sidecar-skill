@@ -10,8 +10,8 @@ Usage:
     python sidecar.py explore --goal "<goal>" [--model <model>] [--dir <dir>]
     python sidecar.py review --scope "<scope>" [--model <model>] [--dir <dir>]
     python sidecar.py log --log-file <path> --goal "<goal>" [--model <model>]
-    python sidecar.py implement --goal "<goal>" --worktree [--model <model>]
-    python sidecar.py test-fix --goal "<goal>" --worktree [--model <model>]
+    python sidecar.py implement --goal "<goal>" [--model <model>]
+    python sidecar.py test-fix --goal "<goal>" [--model <model>]
     python sidecar.py collect --task-id <task-id>
     python sidecar.py list
     python sidecar.py cleanup --task-id <task-id>
@@ -141,8 +141,13 @@ FORBIDDEN_COMMANDS = [
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def generate_task_id() -> str:
+def generate_task_id(project_dir: Path) -> str:
     """Atomically claim a unique task ID in YYYY-MM-DD-NNN format.
+
+    The ID is allocated under ``<project_dir>/.agent_sidecars/tasks/`` so that a
+    task launched with ``--dir B`` only ever writes inside B — never the
+    current working directory. This keeps the task-id allocation location and
+    the actual artifact-write location identical.
 
     Concurrency-safe: the task directory is created with exist_ok=False as part
     of ID generation, so the OS guarantees only one caller can win a given ID.
@@ -151,8 +156,7 @@ def generate_task_id() -> str:
     (which would cause two workers to write into the same task directory).
     """
     today = datetime.now().strftime("%Y-%m-%d")
-    sidecar_dir = Path(SIDECAR_ROOT)
-    tasks_dir = sidecar_dir / TASKS_DIR
+    tasks_dir = project_dir.resolve() / SIDECAR_ROOT / TASKS_DIR
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
     # Determine the highest existing number for today as a starting point.
@@ -660,7 +664,7 @@ class TaskConfig:
     def __init__(self, mode: str, goal: str, model: str, project_dir: Path,
                  worktree: bool = False, scope: str = "", log_file: str = "",
                  timeout: int | None = None):
-        self.task_id = generate_task_id()
+        self.task_id = generate_task_id(project_dir)
         self.created_at = datetime.now(timezone.utc).isoformat()
         self.mode = mode
         self.worker = WORKER_MAP[mode]
@@ -746,18 +750,50 @@ class SidecarOrchestrator:
         """Get the directory for a specific task."""
         return self.tasks_dir / task_id
 
-    def update_index(self, task_config: TaskConfig) -> None:
-        """Update the sidecar index with task info."""
+    def update_index(self, task_config: TaskConfig, task_dir: Path | None = None,
+                     worktree_path: Path | None = None) -> None:
+        """Upsert the task's index entry, keyed by ``task_id``.
+
+        A task transitions running -> completed/failed/partial by being written
+        twice (once at start, once at finish). Upserting — instead of appending
+        — keeps exactly one row per task so ``list`` never shows duplicates and
+        the status reflects the latest write. ``created_at`` is preserved from
+        the first write; ``updated_at`` always reflects this write.
+        """
         index_path = self.sidecar_dir / INDEX_FILE
         index = read_json(index_path) or {"tasks": []}
-        index["tasks"].append({
+        tasks = index.setdefault("tasks", [])
+        now = datetime.now(timezone.utc).isoformat()
+
+        patch_path = ""
+        if task_dir and task_config.worktree:
+            patch_path = str(task_dir / "patch.diff")
+
+        entry = {
             "task_id": task_config.task_id,
             "mode": task_config.mode,
             "worker": task_config.worker,
+            "agent": AGENT_MAP.get(task_config.mode),
             "model": task_config.model,
             "status": task_config.status,
             "created_at": task_config.created_at,
-        })
+            "updated_at": now,
+            "task_dir": str(task_dir) if task_dir else "",
+            "worktree": task_config.worktree,
+            "result_path": str(task_dir / "result.json") if task_dir else "",
+            "patch_path": patch_path,
+        }
+
+        # Find the existing row for this task_id and replace it in place;
+        # preserve the original created_at so a finish-write doesn't reset it.
+        for i, existing in enumerate(tasks):
+            if existing.get("task_id") == task_config.task_id:
+                entry["created_at"] = existing.get("created_at", task_config.created_at)
+                tasks[i] = entry
+                write_json(index_path, index)
+                return
+
+        tasks.append(entry)
         write_json(index_path, index)
 
     def create_worktree(self, task_id: str) -> Path | None:
@@ -818,6 +854,7 @@ class SidecarOrchestrator:
                 f"{get_skill_agents_dir()}. Cannot run without it (would fall "
                 f"back to the default agent).",
             )
+            self.update_index(task_config, task_dir)
             return self._build_return(task_config, task_dir)
         task_dir = self.get_task_dir(task_config.task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -835,8 +872,8 @@ class SidecarOrchestrator:
         )
         (task_dir / "task.md").write_text(task_md, encoding="utf-8")
 
-        # Update index
-        self.update_index(task_config)
+        # Update index (first write: status=running; upserted on finish below)
+        self.update_index(task_config, task_dir)
 
         # Create worktree if needed. Writable modes are forced to worktree in
         # TaskConfig; guard here so a writable task can never execute against
@@ -850,12 +887,14 @@ class SidecarOrchestrator:
                 f"isolated git worktree, but worktree is disabled. Refusing to "
                 f"run against the main working tree.",
             )
+            self.update_index(task_config, task_dir)
             return self._build_return(task_config, task_dir)
         if task_config.worktree:
             worktree_path = self.create_worktree(task_config.task_id)
             if not worktree_path:
                 task_config.status = "failed"
                 self._write_error_result(task_dir, task_config, "Failed to create git worktree.")
+                self.update_index(task_config, task_dir)
                 return self._build_return(task_config, task_dir)
 
         # Build opencode command
@@ -930,8 +969,8 @@ class SidecarOrchestrator:
         }
         write_json(task_dir / "metadata.json", metadata)
 
-        # Update index with final status
-        self.update_index(task_config)
+        # Update index with final status (upserts the running row written above)
+        self.update_index(task_config, task_dir, worktree_path)
 
         return self._build_return(task_config, task_dir)
 
@@ -1813,7 +1852,7 @@ def main():
     p_implement = subparsers.add_parser("implement", help="Run implementation (always in an isolated worktree)")
     p_implement.add_argument("--goal", required=True, help="Implementation goal")
     p_implement.add_argument("--worktree", action="store_true", default=True,
-                             help="Use isolated worktree (always on for writable modes)")
+                             help="Deprecated no-op; writable modes always use an isolated worktree.")
     p_implement.add_argument("--model", help="Model to use")
     p_implement.add_argument("--dir", help="Project directory")
     p_implement.add_argument("--timeout", type=int, help="Timeout in seconds")
@@ -1822,7 +1861,7 @@ def main():
     p_test_fix = subparsers.add_parser("test-fix", help="Run test fix (always in an isolated worktree)")
     p_test_fix.add_argument("--goal", required=True, help="Test fix goal")
     p_test_fix.add_argument("--worktree", action="store_true", default=True,
-                            help="Use isolated worktree (always on for writable modes)")
+                            help="Deprecated no-op; writable modes always use an isolated worktree.")
     p_test_fix.add_argument("--model", help="Model to use")
     p_test_fix.add_argument("--dir", help="Project directory")
     p_test_fix.add_argument("--timeout", type=int, help="Timeout in seconds")
