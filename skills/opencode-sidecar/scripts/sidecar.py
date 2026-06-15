@@ -65,18 +65,15 @@ TASKS_DIR = "tasks"
 WORKTREES_DIR = "worktrees"
 INDEX_FILE = "index.json"
 
-WORKER_MAP = {
-    "explore": "code-explorer",
-    "review": "git-diff-reviewer",
-    "log": "log-failure-analyzer",
-    "implement": "worktree-worker",
-    "test-fix": "worktree-worker",
-}
-
-# Maps each mode to the OpenCode subagent name. The agent name equals the
-# markdown file name (without .md) under opencode/agents/. These agents carry
-# engine-enforced permissions (read-only vs. worktree-writable), so the worker
+# Maps each mode to its OpenCode worker agent. The agent name equals the
+# markdown file name (without .md) under opencode/agents/. These are OpenCode
+# *primary* agents (mode: primary) so `opencode run --agent <name>` selects
+# them directly without falling back to the default agent. They carry
+# engine-enforced permissions (read-only vs. worktree-writable), so each worker
 # is constrained by OpenCode itself, not only by prompt instructions.
+#
+# The agent name is also the canonical `worker` identity recorded in task.json
+# and result.json (one naming system, matching schemas/*.schema.json).
 AGENT_MAP = {
     "explore": "sidecar-explorer",
     "review": "sidecar-reviewer",
@@ -84,6 +81,14 @@ AGENT_MAP = {
     "implement": "sidecar-implementer",
     "test-fix": "sidecar-test-fixer",
 }
+
+# `worker` in the task/result envelopes is the agent name (single source of
+# truth). Kept as an alias so existing references read clearly.
+WORKER_MAP = AGENT_MAP
+
+# Modes whose worker writes files; these MUST run inside an isolated git
+# worktree (never the main working tree).
+WRITABLE_MODES = {"implement", "test-fix"}
 
 TEMPLATE_MAP = {
     "explore": "task_explore.md",
@@ -114,11 +119,15 @@ CONFIG_FILENAME = ".opencode-sidecar.json"
 ENV_FAST_MODEL = "OPENCODE_SIDECAR_FAST_MODEL"
 ENV_QUALITY_MODEL = "OPENCODE_SIDECAR_QUALITY_MODEL"
 
+# Glob patterns (fnmatch) for files a worker patch must never touch. Matched
+# against each changed file path with fnmatch, so wildcards work correctly
+# (a substring check could never match "*.pem"). Patterns are tested against
+# both the full path and the basename so "*.pem" matches "certs/server.pem".
 SENSITIVE_FILES = [
-    ".env", ".env.",
+    "*.env", "*.env.*", ".env", ".env.*",
     "*.pem", "*.key", "*.p12", "*.pfx",
-    "id_rsa", "id_ed25519",
-    "secrets.", "credentials.",
+    "id_rsa", "id_ed25519", "*id_rsa*", "*id_ed25519*",
+    "*secret*", "*credential*",
 ]
 
 FORBIDDEN_COMMANDS = [
@@ -205,11 +214,49 @@ def _score_model(model_id: str) -> tuple[int, int]:
     return fast, quality
 
 
+def list_loaded_agents(config_dir: Path | None = None) -> dict[str, str]:
+    """Return {agent_name: mode} as OpenCode resolves them.
+
+    Runs `opencode agent list` with OPENCODE_CONFIG_DIR set to the bundled
+    config dir (so the sidecar agents are included) and parses the
+    "name (mode)" header lines it prints. Used by `doctor` to confirm each
+    worker agent loads and is `primary` (not `subagent`, which would make
+    `opencode run --agent` fall back to the default agent).
+    """
+    import re
+
+    opencode = get_opencode_path()
+    if not opencode:
+        return {}
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG_DIR"] = str(config_dir or get_opencode_config_dir())
+    try:
+        r = subprocess.run(
+            [opencode, "agent", "list"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30, env=env,
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    out = r.stdout if r.returncode == 0 else ""
+    agents: dict[str, str] = {}
+    # Header lines look like: "sidecar-reviewer (primary)"
+    pat = re.compile(r"^([A-Za-z0-9._-]+)\s+\((primary|subagent|all)\)\s*$")
+    for line in out.splitlines():
+        m = pat.match(_strip_ansi(line).strip())
+        if m:
+            agents[m.group(1)] = m.group(2)
+    return agents
+
+
 def detect_available_models() -> tuple[list[str], list[str]]:
     """Probe opencode for (all known model ids, authed provider display names).
 
-    Runs `opencode models` and `opencode providers list`. Returns two lists.
-    Either may be empty if the commands fail.
+    Runs `opencode models` (one `provider/model` id per line) and
+    `opencode auth list` (the canonical command; `providers list` is an alias).
+    `auth list` prints a boxed list where each authed provider is a
+    "<bullet>  Name api" row. Returns two lists; either may be empty if the
+    commands fail.
     """
     def _run(args: list[str]) -> str:
         try:
@@ -225,20 +272,24 @@ def detect_available_models() -> tuple[list[str], list[str]]:
         except Exception:  # noqa: BLE001
             return ""
 
-    models_out = _run([get_opencode_path() or "opencode", "models"])
-    providers_out = _run([get_opencode_path() or "opencode", "providers", "list"])
+    opencode = get_opencode_path() or "opencode"
+    models_out = _run([opencode, "models"])
+    # `auth list` is the documented command; fall back to its `providers` alias.
+    auth_out = _run([opencode, "auth", "list"]) or _run([opencode, "providers", "list"])
 
     model_ids: list[str] = []
     for line in models_out.splitlines():
-        line = line.strip()
+        line = _strip_ansi(line).strip()
         # model ids look like provider/model or provider/sub/model
         if "/" in line and not line.startswith("opencode ") and " " not in line:
             model_ids.append(line)
 
     authed_names: list[str] = []
-    for line in providers_out.splitlines():
-        # strip ANSI escape codes first
+    for line in auth_out.splitlines():
+        # strip ANSI escape codes and box-drawing chars first
         clean_line = _strip_ansi(line)
+        for box in ("┌", "│", "└", "├", "─"):
+            clean_line = clean_line.replace(box, " ")
         # authed providers appear as "<bullet>  Name api" where bullet is
         # U+2022 (•) or U+25CF (●)
         has_bullet = any(b in clean_line for b in ("•", "●"))
@@ -373,9 +424,21 @@ def get_templates_dir() -> Path:
     return get_skill_dir() / "templates"
 
 
+def get_opencode_config_dir() -> Path:
+    """Directory passed to OpenCode via OPENCODE_CONFIG_DIR.
+
+    OpenCode loads agents/commands/modes/plugins from `<dir>/agents/` etc.,
+    exactly like a `.opencode` directory. Pointing it at the skill's bundled
+    `opencode/` folder makes the sidecar worker agents available without
+    copying anything into the user's project `.opencode/agents/` and without
+    losing the user's provider/auth config (verified on opencode 1.17.4).
+    """
+    return get_skill_dir() / "opencode"
+
+
 def get_skill_agents_dir() -> Path:
-    """Get the directory holding the bundled OpenCode subagent definitions."""
-    return get_skill_dir() / "opencode" / "agents"
+    """Get the directory holding the bundled OpenCode worker agent definitions."""
+    return get_opencode_config_dir() / "agents"
 
 
 def check_git_repo(project_dir: Path) -> bool:
@@ -438,27 +501,56 @@ def load_template(mode: str, task_id: str, goal: str, scope: str = "", log_file:
 
 
 def check_sensitive_files(patch_content: str) -> list[str]:
-    """Check if patch touches sensitive files."""
+    """Flag any sensitive files touched by a patch.
+
+    Uses the changed-file set parsed from the diff headers and matches each
+    path against SENSITIVE_FILES with fnmatch (so glob patterns like "*.pem"
+    actually match). Each pattern is tested against both the full path and the
+    basename, so "*.pem" catches "certs/server.pem".
+    """
+    import fnmatch
+
     warnings = []
-    for line in patch_content.split("\n"):
-        if line.startswith("diff --git"):
-            for pattern in SENSITIVE_FILES:
-                if pattern in line:
-                    warnings.append(f"Patch touches sensitive file pattern: {pattern} (line: {line.strip()})")
+    changed = parse_patch_files(patch_content)
+    for path in sorted(changed):
+        base = path.rsplit("/", 1)[-1]
+        for pattern in SENSITIVE_FILES:
+            if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(base, pattern):
+                warnings.append(
+                    f"Patch touches sensitive file: {path} (matched pattern: {pattern})"
+                )
+                break
     return warnings
 
 
-def _extract_executed_commands(output: str) -> list[str] | None:
-    """Pull actually-executed shell commands out of opencode JSON event output.
+def parse_event_stream(output: str) -> dict:
+    """Parse an `opencode run --format json` event stream.
 
-    opencode --format json emits one JSON object per line; a real shell
-    invocation appears as a tool part with tool=="bash" and
-    input.command=="...". Returns the list of executed command strings, or
-    None if the output isn't structured JSON events (so the caller can fall
-    back to a raw substring scan).
+    The stream is line-delimited JSON (one object per line), NOT a single
+    final-answer JSON. Each object looks like:
+
+        {"type": "<type>", "timestamp": ..., "sessionID": "...", "part": {...}}
+
+    Verified event types (opencode 1.17.4): `step_start`, `text`,
+    `step_finish`, `tool_use`, `reasoning`, `error`. The assistant's prose
+    lives in `text` events under `part.text`; an executed shell command lives
+    in a `tool_use` event whose `part.tool == "bash"` at
+    `part.state.input.command`.
+
+    Returns a dict with:
+      - "is_json":  True if at least one well-formed event line was seen.
+      - "text":     concatenation of all `text` event `part.text` values
+                    (the worker's human-readable answer).
+      - "commands": list of executed shell command strings.
+      - "errors":   list of error event payloads (stringified).
+      - "events":   the raw parsed event objects (for events.jsonl / debugging).
     """
+    text_parts: list[str] = []
     commands: list[str] = []
+    errors: list[str] = []
+    events: list[dict] = []
     saw_json = False
+
     for line in output.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -467,15 +559,47 @@ def _extract_executed_commands(output: str) -> list[str] | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
         saw_json = True
-        part = event.get("part") if isinstance(event, dict) else None
-        if isinstance(part, dict) and part.get("tool") == "bash":
+        events.append(event)
+
+        etype = event.get("type")
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+
+        if etype == "text":
+            txt = part.get("text")
+            if isinstance(txt, str) and txt.strip():
+                text_parts.append(txt)
+        elif etype == "tool_use" and part.get("tool") == "bash":
             state = part.get("state") or {}
             inp = state.get("input") or {}
             cmd = inp.get("command")
             if isinstance(cmd, str):
                 commands.append(cmd)
-    return commands if saw_json else None
+        elif etype == "error":
+            err = event.get("error")
+            if err is not None:
+                errors.append(json.dumps(err, ensure_ascii=False) if not isinstance(err, str) else err)
+
+    return {
+        "is_json": saw_json,
+        "text": "\n".join(text_parts),
+        "commands": commands,
+        "errors": errors,
+        "events": events,
+    }
+
+
+def _extract_executed_commands(output: str) -> list[str] | None:
+    """Pull actually-executed shell commands out of opencode JSON event output.
+
+    Returns the list of executed command strings, or None if the output isn't
+    a structured JSON event stream (so the caller can fall back to a raw
+    substring scan of plain text).
+    """
+    parsed = parse_event_stream(output)
+    return parsed["commands"] if parsed["is_json"] else None
 
 
 def check_forbidden_commands(output: str) -> list[str]:
@@ -494,6 +618,25 @@ def check_forbidden_commands(output: str) -> list[str]:
         if any(cmd in h for h in haystacks):
             violations.append(f"Forbidden command detected: {cmd}")
     return violations
+
+
+def detect_agent_fallback(output: str) -> str | None:
+    """Detect OpenCode's "falling back to default agent" warning.
+
+    `opencode run --agent <name>` prints a warning and silently runs the
+    default agent when the named agent is missing or is a subagent (verified
+    in run.ts `localAgent()` / `attachAgent()`). When that happens the worker
+    runs WITHOUT the agent's engine-enforced permissions, so the sidecar
+    safety model is void. Returns the matched reason string, or None.
+    """
+    low = output.lower()
+    if "falling back to default agent" in low:
+        if "is a subagent" in low:
+            return "named agent is a subagent (must be mode: primary)"
+        if "not found" in low:
+            return "named agent not found"
+        return "unspecified fallback"
+    return None
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -523,7 +666,9 @@ class TaskConfig:
         self.worker = WORKER_MAP[mode]
         self.model = model
         self.project_dir = str(project_dir.resolve())
-        self.worktree = worktree
+        # Writable modes MUST run in an isolated git worktree — never the main
+        # working tree. Enforced here so no CLI path can bypass it.
+        self.worktree = True if mode in WRITABLE_MODES else worktree
         self.goal = goal
         self.scope = scope
         self.log_file = log_file
@@ -581,28 +726,21 @@ class SidecarOrchestrator:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
 
-    def sync_agents(self) -> list[str]:
-        """Copy bundled sidecar subagent definitions into the project's
-        .opencode/agents/ so OpenCode loads them with engine-enforced
-        permissions.
+    def available_agents(self) -> list[str]:
+        """List bundled worker agent names that exist on disk.
 
-        OpenCode discovers agents by walking up from the working directory to
-        find a .opencode/agents/ folder, so placing them at the project root
-        covers both read-only tasks (run at the project root) and writable
-        tasks (run inside a worktree nested under the project). Only the
-        sidecar-*.md files are written; any user-authored agents are left
-        untouched. Returns the list of agent names made available.
+        Agents are NOT copied into the user's project. They are loaded directly
+        from the skill's bundled `opencode/` directory by passing
+        `OPENCODE_CONFIG_DIR` to the opencode subprocess (see
+        `_run_opencode_streamed`). This keeps the user's project `.opencode/`
+        and global config untouched, and works regardless of the worker's cwd
+        (so worktree-nested runs load the same agents).
         """
         src_dir = get_skill_agents_dir()
-        dst_dir = self.project_dir / ".opencode" / "agents"
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        synced = []
-        for agent_name in AGENT_MAP.values():
-            src = src_dir / f"{agent_name}.md"
-            if src.exists():
-                shutil.copyfile(src, dst_dir / f"{agent_name}.md")
-                synced.append(agent_name)
-        return synced
+        return [
+            name for name in AGENT_MAP.values()
+            if (src_dir / f"{name}.md").exists()
+        ]
 
     def get_task_dir(self, task_id: str) -> Path:
         """Get the directory for a specific task."""
@@ -664,8 +802,23 @@ class SidecarOrchestrator:
     def run_task(self, task_config: TaskConfig) -> dict:
         """Execute a sidecar task and return results."""
         self.ensure_dirs()
-        # Make the engine-permissioned subagents available to OpenCode.
-        synced_agents = self.sync_agents()
+        # Worker agents are loaded by OpenCode from the bundled config dir via
+        # OPENCODE_CONFIG_DIR (set in _run_opencode_streamed) — nothing is
+        # copied into the user's project. Verify the agent file exists so a
+        # missing definition fails loudly instead of silently falling back to
+        # the default agent.
+        agent_name = AGENT_MAP.get(task_config.mode)
+        if agent_name and agent_name not in self.available_agents():
+            task_dir = self.get_task_dir(task_config.task_id)
+            task_dir.mkdir(parents=True, exist_ok=True)
+            task_config.status = "failed"
+            self._write_error_result(
+                task_dir, task_config,
+                f"Worker agent '{agent_name}' not found in bundled config dir "
+                f"{get_skill_agents_dir()}. Cannot run without it (would fall "
+                f"back to the default agent).",
+            )
+            return self._build_return(task_config, task_dir)
         task_dir = self.get_task_dir(task_config.task_id)
         task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -685,8 +838,19 @@ class SidecarOrchestrator:
         # Update index
         self.update_index(task_config)
 
-        # Create worktree if needed
+        # Create worktree if needed. Writable modes are forced to worktree in
+        # TaskConfig; guard here so a writable task can never execute against
+        # the main working tree even if invoked through some other path.
         worktree_path = None
+        if task_config.mode in WRITABLE_MODES and not task_config.worktree:
+            task_config.status = "failed"
+            self._write_error_result(
+                task_dir, task_config,
+                f"Mode '{task_config.mode}' is writable and must run in an "
+                f"isolated git worktree, but worktree is disabled. Refusing to "
+                f"run against the main working tree.",
+            )
+            return self._build_return(task_config, task_dir)
         if task_config.worktree:
             worktree_path = self.create_worktree(task_config.task_id)
             if not worktree_path:
@@ -711,6 +875,17 @@ class SidecarOrchestrator:
         security_warnings.extend(check_forbidden_commands(stdout))
         security_warnings.extend(check_forbidden_commands(stderr))
 
+        # Detect agent fallback: opencode prints a warning and runs the default
+        # agent (losing all engine-enforced permissions) when --agent names a
+        # missing agent or a subagent. Treat it as a hard failure — the worker
+        # ran unconstrained, so its output cannot be trusted as sidecar-safe.
+        fallback = detect_agent_fallback(stdout) or detect_agent_fallback(stderr)
+        if fallback:
+            security_warnings.append(
+                f"CRITICAL: worker fell back to the default agent "
+                f"({fallback}). Engine permissions were NOT enforced."
+            )
+
         # Export patch for writable tasks
         if task_config.worktree and worktree_path and worktree_path.exists():
             self._export_patch(task_config.task_id, worktree_path, task_dir)
@@ -724,6 +899,9 @@ class SidecarOrchestrator:
 
         # Determine status
         if returncode != 0:
+            task_config.status = "failed"
+        elif fallback:
+            # Agent fell back to default → ran without engine permissions.
             task_config.status = "failed"
         elif not stdout.strip():
             task_config.status = "partial"
@@ -785,6 +963,15 @@ class SidecarOrchestrator:
         else:
             popen_kwargs["start_new_session"] = True
 
+        # Load the bundled worker agents via OPENCODE_CONFIG_DIR instead of
+        # copying them into the user's project. OpenCode reads agents/commands/
+        # modes/plugins from this dir like a .opencode folder, merged after the
+        # user's global + project config (so provider/auth stays intact).
+        # Verified on opencode 1.17.4: the agent resolves as primary with no
+        # fallback, and `opencode auth list` still shows all credentials.
+        env = os.environ.copy()
+        env["OPENCODE_CONFIG_DIR"] = str(get_opencode_config_dir())
+
         try:
             with open(stdout_path, "w", encoding="utf-8") as out_f, \
                  open(stderr_path, "w", encoding="utf-8") as err_f:
@@ -796,6 +983,7 @@ class SidecarOrchestrator:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env=env,
                     **popen_kwargs,
                 )
                 try:
@@ -844,9 +1032,12 @@ class SidecarOrchestrator:
         # Model
         cmd.extend(["--model", task_config.model])
 
-        # Agent — selects the engine-permissioned subagent for this mode.
-        # The agent enforces read-only vs. writable access at the OpenCode
-        # layer; the prompt constraints below are a secondary guard.
+        # Agent — selects the engine-permissioned worker agent for this mode.
+        # It is a mode: primary agent (loaded via OPENCODE_CONFIG_DIR), so
+        # `opencode run --agent` uses it directly instead of falling back to
+        # the default agent. The agent enforces read-only vs. writable access
+        # at the OpenCode layer; the prompt constraints below are a secondary
+        # guard.
         agent_name = AGENT_MAP.get(task_config.mode)
         if agent_name:
             cmd.extend(["--agent", agent_name])
@@ -898,9 +1089,44 @@ class SidecarOrchestrator:
     def _generate_result(self, task_config: TaskConfig, task_dir: Path,
                          stdout: str, stderr: str, security_warnings: list[str],
                          returncode: int) -> None:
-        """Generate result.md and result.json from worker output."""
-        # Try to extract JSON from stdout
-        result_json = self._extract_result_json(stdout, task_config)
+        """Generate result artifacts from the worker's --format json output.
+
+        The opencode stdout is a JSONL event stream, not the worker's answer.
+        We parse it once and write:
+          - events.jsonl   : the raw parsed events (one JSON object per line)
+          - worker_text.md : the worker's human-readable text (text events)
+        The structured result.json is then extracted from worker_text (which
+        is where a worker emits its ```json block), falling back to a scan of
+        the whole stream only if needed.
+        """
+        parsed = parse_event_stream(stdout)
+        worker_text = parsed["text"]
+
+        # Persist the raw event stream for debugging/audit.
+        if parsed["events"]:
+            events_lines = [json.dumps(e, ensure_ascii=False) for e in parsed["events"]]
+            (task_dir / "events.jsonl").write_text(
+                "\n".join(events_lines) + "\n", encoding="utf-8"
+            )
+
+        # Persist the extracted worker text (the actual answer).
+        (task_dir / "worker_text.md").write_text(
+            worker_text if worker_text.strip() else "(no text events emitted)\n",
+            encoding="utf-8",
+        )
+
+        # Extract structured result from the worker text first (that's where
+        # the worker writes its JSON block); fall back to the raw stream.
+        result_json = self._extract_result_json(worker_text, task_config)
+        if result_json.get("_auto_generated") and stdout.strip() and stdout != worker_text:
+            alt = self._extract_result_json(stdout, task_config)
+            if not alt.get("_auto_generated"):
+                result_json = alt
+        result_json.pop("_auto_generated", None)
+
+        # Surface executed commands the parser already found.
+        if parsed["commands"] and not result_json.get("commands_run"):
+            result_json["commands_run"] = parsed["commands"]
 
         # Generate result.md
         result_md_parts = [
@@ -938,20 +1164,19 @@ class SidecarOrchestrator:
                 "",
             ])
 
-        if stdout.strip():
+        # Show the extracted worker text (the answer), not the raw event stream.
+        if worker_text.strip():
             result_md_parts.extend([
                 "## Worker Output",
                 "",
-                "```",
-                stdout[:10000],  # Truncate very long output
-                "```",
+                worker_text[:10000],  # Truncate very long output
                 "",
             ])
         else:
             result_md_parts.extend([
                 "## Worker Output",
                 "",
-                "(empty)",
+                "(no text events emitted — see events.jsonl and stdout.log)",
                 "",
             ])
 
@@ -970,16 +1195,29 @@ class SidecarOrchestrator:
         # Generate result.json
         write_json(task_dir / "result.json", result_json)
 
-    def _extract_result_json(self, stdout: str, task_config: TaskConfig) -> dict:
-        """Try to extract structured JSON result from worker output."""
-        # Look for JSON blocks in the output
+    def _extract_result_json(self, text: str, task_config: TaskConfig) -> dict:
+        """Extract a structured JSON result from the worker's text.
+
+        `text` should be the worker's human-readable answer (the concatenated
+        text events), where a worker emits its ```json result block. Returns
+        the parsed result with envelope fields filled in. If no usable JSON is
+        found, returns an auto-generated fallback marked with
+        `_auto_generated: True` so the caller can retry against another source.
+        """
+        def _finish(data: dict) -> dict:
+            data.setdefault("task_id", task_config.task_id)
+            data.setdefault("worker", task_config.worker)
+            data.setdefault("model", task_config.model)
+            data.setdefault("status", task_config.status)
+            return data
+
+        # Collect fenced code block candidates (```json ... ``` or ``` ... ```).
         json_candidates = []
         in_json = False
-        json_lines = []
-
-        for line in stdout.split("\n"):
+        json_lines: list[str] = []
+        for line in text.split("\n"):
             stripped = line.strip()
-            if stripped.startswith("```json") or stripped.startswith("```"):
+            if stripped.startswith("```"):
                 if in_json:
                     json_candidates.append("\n".join(json_lines))
                     json_lines = []
@@ -989,56 +1227,54 @@ class SidecarOrchestrator:
                 continue
             if in_json:
                 json_lines.append(line)
-
         if json_lines:
             json_candidates.append("\n".join(json_lines))
 
-        # Try to parse each candidate
+        # Also consider the whole text as a candidate (worker may emit bare JSON).
+        json_candidates.append(text)
+
+        # Prefer the candidate that parses to a dict carrying the most sidecar
+        # result fields (so a "summary"-only object loses to a full result).
+        sidecar_keys = (
+            "summary", "findings", "status", "confidence", "files_changed",
+            "risks", "uncertainties", "requires_main_agent_decision",
+        )
+        best: dict | None = None
+        best_score = -1
         for candidate in json_candidates:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
             try:
                 data = json.loads(candidate)
-                if isinstance(data, dict) and ("task_id" in data or "summary" in data):
-                    data.setdefault("task_id", task_config.task_id)
-                    data.setdefault("worker", task_config.worker)
-                    data.setdefault("model", task_config.model)
-                    data.setdefault("status", task_config.status)
-                    return data
             except json.JSONDecodeError:
                 continue
+            if not isinstance(data, dict):
+                continue
+            if not ("task_id" in data or "summary" in data or "findings" in data):
+                continue
+            score = sum(1 for k in sidecar_keys if k in data)
+            if score > best_score:
+                best, best_score = data, score
+        if best is not None:
+            return _finish(best)
 
-        # Try to find JSON object in the entire output
-        for start_char in ["{"]:
-            idx = stdout.find(start_char)
-            while idx != -1:
-                for end_idx in range(len(stdout) - 1, idx, -1):
-                    if stdout[end_idx] == "}":
-                        try:
-                            data = json.loads(stdout[idx:end_idx + 1])
-                            if isinstance(data, dict) and len(data) > 2:
-                                data.setdefault("task_id", task_config.task_id)
-                                data.setdefault("worker", task_config.worker)
-                                data.setdefault("model", task_config.model)
-                                data.setdefault("status", task_config.status)
-                                return data
-                        except json.JSONDecodeError:
-                            pass
-                idx = stdout.find(start_char, idx + 1)
-
-        # Fallback: create a basic result from the output
+        # Fallback: synthesize a minimal result from the raw text.
         return {
             "task_id": task_config.task_id,
             "worker": task_config.worker,
             "model": task_config.model,
             "status": task_config.status,
             "confidence": "low",
-            "summary": stdout[:500] if stdout.strip() else "No output captured.",
+            "summary": text[:500] if text.strip() else "No worker text captured.",
             "findings": [],
             "files_changed": [],
             "commands_run": [],
             "tests_run": [],
             "risks": ["Worker did not produce structured JSON output."],
-            "uncertainties": ["Result was auto-generated from raw output."],
+            "uncertainties": ["Result was auto-generated from raw worker text."],
             "requires_main_agent_decision": True,
+            "_auto_generated": True,
         }
 
     def _export_patch(self, task_id: str, worktree_path: Path, task_dir: Path) -> None:
@@ -1101,6 +1337,8 @@ class SidecarOrchestrator:
             "metadata_json": str(task_dir / "metadata.json"),
             "stdout_log": str(task_dir / "stdout.log"),
             "stderr_log": str(task_dir / "stderr.log"),
+            "events_jsonl": str(task_dir / "events.jsonl"),
+            "worker_text": str(task_dir / "worker_text.md"),
             "patch_diff": str(task_dir / "patch.diff") if task_config.worktree else None,
         }
 
@@ -1387,6 +1625,133 @@ def cmd_config_set(args, orchestrator: SidecarOrchestrator) -> None:
     print(f"  review, implement, test-fix -> quality -> {args.quality}")
 
 
+def cmd_doctor(args, orchestrator: SidecarOrchestrator) -> None:
+    """Diagnose the sidecar setup without running a worker.
+
+    Checks: opencode is installed; the bundled config dir + agent files exist;
+    each mode's worker agent loads via OPENCODE_CONFIG_DIR and is `primary`
+    (so `opencode run --agent` won't fall back to the default agent); and that
+    at least one model/credential is available. Prints a checklist and exits
+    non-zero if any hard check fails.
+    """
+    ok = True
+
+    def check(label: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        mark = "PASS" if passed else "FAIL"
+        if not passed:
+            ok = False
+        print(f"  [{mark}] {label}" + (f" — {detail}" if detail else ""))
+
+    print("OpenCode Sidecar Doctor")
+    print()
+
+    # 1. opencode present
+    opencode_path = get_opencode_path()
+    check("opencode CLI on PATH", bool(opencode_path), opencode_path or "not found")
+
+    # 2. bundled config dir + agent files
+    cfg_dir = get_opencode_config_dir()
+    agents_dir = get_skill_agents_dir()
+    check("bundled config dir exists", cfg_dir.is_dir(), str(cfg_dir))
+    available = orchestrator.available_agents()
+    expected = sorted(set(AGENT_MAP.values()))
+    missing = [a for a in expected if a not in available]
+    check("all worker agent files present", not missing,
+          "missing: " + ", ".join(missing) if missing else f"{len(expected)} agents")
+
+    # 3. agents load and are primary (only if opencode is available)
+    if opencode_path:
+        loaded = list_loaded_agents(cfg_dir)
+        for mode, agent_name in AGENT_MAP.items():
+            mode_label = loaded.get(agent_name)
+            if mode_label is None:
+                check(f"agent '{agent_name}' ({mode}) loads", False, "not listed by `opencode agent list`")
+            elif mode_label == "subagent":
+                check(f"agent '{agent_name}' is primary", False,
+                      "mode is 'subagent' → run --agent would fall back to default")
+            else:
+                check(f"agent '{agent_name}' is primary", True, f"mode: {mode_label}")
+
+        # 4. models / credentials
+        model_ids, authed = detect_available_models()
+        check("models available (`opencode models`)", bool(model_ids), f"{len(model_ids)} models")
+        check("credentials present (`opencode auth list`)", bool(authed),
+              ", ".join(authed) if authed else "none — run `opencode auth login`")
+    else:
+        print("  [skip] agent/model checks (opencode not installed)")
+
+    # 5. project config
+    cfg = read_config(orchestrator.project_dir)
+    if cfg:
+        print(f"  [info] model config: fast={cfg.get('fast_model')} quality={cfg.get('quality_model')}")
+    else:
+        print("  [info] no model config yet — run `init` then `config set` (auto-detect also works)")
+
+    print()
+    print("Doctor result:", "OK" if ok else "PROBLEMS FOUND")
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_verify_agent(args, orchestrator: SidecarOrchestrator) -> None:
+    """Run a minimal real prompt against a worker agent to confirm no fallback.
+
+    Unlike `doctor` (static checks), this actually invokes
+    `opencode run --agent <name> --format json` with a trivial prompt and the
+    bundled OPENCODE_CONFIG_DIR, then checks that OpenCode did NOT print the
+    "falling back to default agent" warning. Use it to confirm end-to-end that
+    a worker runs under its own (engine-enforced) agent.
+    """
+    agent_name = args.agent or AGENT_MAP["review"]
+    model = args.model or resolve_model("review", orchestrator.project_dir, None)
+    opencode_path = get_opencode_path()
+    if not opencode_path:
+        print("ERROR: opencode not found.", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [
+        opencode_path, "run",
+        "--agent", agent_name,
+        "--model", model,
+        "--format", "json",
+        "Reply with exactly: VERIFY_OK. Do not modify any files.",
+    ]
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG_DIR"] = str(get_opencode_config_dir())
+
+    print(f"Verifying agent '{agent_name}' with model '{model}'...")
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(orchestrator.project_dir),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=args.timeout or 120, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        print("FAIL: verification timed out.", file=sys.stderr)
+        sys.exit(1)
+
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    fallback = detect_agent_fallback(combined)
+    parsed = parse_event_stream(r.stdout or "")
+
+    if fallback:
+        print(f"  [FAIL] agent fell back to default: {fallback}")
+        print("  The agent is NOT being used. Check that it exists and is mode: primary.")
+        sys.exit(1)
+
+    print(f"  [PASS] no fallback warning — '{agent_name}' ran as the selected agent.")
+    if parsed["is_json"]:
+        print(f"  [PASS] received {len(parsed['events'])} JSON events; "
+              f"worker text: {parsed['text'][:80]!r}")
+    else:
+        print("  [warn] output was not a JSON event stream (check --format support).")
+    if r.returncode != 0:
+        print(f"  [warn] opencode exited {r.returncode}.")
+
+
+
+
 # ── Output ─────────────────────────────────────────────────────────────────
 
 def print_result(result: dict) -> None:
@@ -1445,17 +1810,19 @@ def main():
     p_log.add_argument("--timeout", type=int, help="Timeout in seconds")
 
     # implement
-    p_implement = subparsers.add_parser("implement", help="Run implementation")
+    p_implement = subparsers.add_parser("implement", help="Run implementation (always in an isolated worktree)")
     p_implement.add_argument("--goal", required=True, help="Implementation goal")
-    p_implement.add_argument("--worktree", action="store_true", help="Use isolated worktree")
+    p_implement.add_argument("--worktree", action="store_true", default=True,
+                             help="Use isolated worktree (always on for writable modes)")
     p_implement.add_argument("--model", help="Model to use")
     p_implement.add_argument("--dir", help="Project directory")
     p_implement.add_argument("--timeout", type=int, help="Timeout in seconds")
 
     # test-fix
-    p_test_fix = subparsers.add_parser("test-fix", help="Run test fix")
+    p_test_fix = subparsers.add_parser("test-fix", help="Run test fix (always in an isolated worktree)")
     p_test_fix.add_argument("--goal", required=True, help="Test fix goal")
-    p_test_fix.add_argument("--worktree", action="store_true", help="Use isolated worktree")
+    p_test_fix.add_argument("--worktree", action="store_true", default=True,
+                            help="Use isolated worktree (always on for writable modes)")
     p_test_fix.add_argument("--model", help="Model to use")
     p_test_fix.add_argument("--dir", help="Project directory")
     p_test_fix.add_argument("--timeout", type=int, help="Timeout in seconds")
@@ -1463,33 +1830,57 @@ def main():
     # collect
     p_collect = subparsers.add_parser("collect", help="Collect task results")
     p_collect.add_argument("--task-id", required=True, help="Task ID")
+    p_collect.add_argument("--dir", help="Project directory")
 
     # list
-    subparsers.add_parser("list", help="List all tasks")
+    p_list = subparsers.add_parser("list", help="List all tasks")
+    p_list.add_argument("--dir", help="Project directory")
 
     # cleanup
     p_cleanup = subparsers.add_parser("cleanup", help="Clean up a task")
     p_cleanup.add_argument("--task-id", required=True, help="Task ID")
+    p_cleanup.add_argument("--dir", help="Project directory")
 
     # check-conflicts
-    subparsers.add_parser(
+    p_conflicts = subparsers.add_parser(
         "check-conflicts",
         help="Detect file overlaps between worktree task patches",
     )
+    p_conflicts.add_argument("--dir", help="Project directory")
 
     # init — onboarding: probe models and print guidance
-    subparsers.add_parser(
+    p_init = subparsers.add_parser(
         "init",
         help="Probe available opencode models and print onboarding guidance",
     )
+    p_init.add_argument("--dir", help="Project directory")
 
     # config — show / set the project model config
     p_config = subparsers.add_parser("config", help="Manage model config")
     config_sub = p_config.add_subparsers(dest="config_command")
-    config_sub.add_parser("show", help="Show current model config")
+    p_config_show = config_sub.add_parser("show", help="Show current model config")
+    p_config_show.add_argument("--dir", help="Project directory")
     p_config_set = config_sub.add_parser("set", help="Set fast/quality models")
     p_config_set.add_argument("--fast", required=True, help="Model id for fast tier")
     p_config_set.add_argument("--quality", required=True, help="Model id for quality tier")
+    p_config_set.add_argument("--dir", help="Project directory")
+
+    # doctor — static health check (no worker run)
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="Diagnose setup: opencode, agents loaded as primary, permissions, models",
+    )
+    p_doctor.add_argument("--dir", help="Project directory")
+
+    # verify-agent — run a minimal prompt to confirm no fallback to default agent
+    p_verify = subparsers.add_parser(
+        "verify-agent",
+        help="Run a minimal prompt to confirm a worker agent runs without fallback",
+    )
+    p_verify.add_argument("--agent", help="Agent name to verify (default: sidecar-reviewer)")
+    p_verify.add_argument("--model", help="Model to use")
+    p_verify.add_argument("--dir", help="Project directory")
+    p_verify.add_argument("--timeout", type=int, help="Timeout in seconds")
 
     args = parser.parse_args()
 
@@ -1506,8 +1897,10 @@ def main():
         print("Please run this command from within a git repository.", file=sys.stderr)
         sys.exit(1)
 
-    # Commands that don't invoke opencode: don't require it installed.
-    no_opencode_commands = ("collect", "list", "cleanup", "check-conflicts", "config")
+    # Commands that don't invoke opencode directly: don't require it installed.
+    # `doctor` intentionally runs anyway — diagnosing a missing opencode is its
+    # job, so it reports the problem instead of aborting in the pre-flight.
+    no_opencode_commands = ("collect", "list", "cleanup", "check-conflicts", "config", "doctor")
     if args.command not in no_opencode_commands:
         if not check_opencode_available():
             print("ERROR: opencode command not found.", file=sys.stderr)
@@ -1528,6 +1921,8 @@ def main():
         "cleanup": cmd_cleanup,
         "check-conflicts": cmd_check_conflicts,
         "init": cmd_init,
+        "doctor": cmd_doctor,
+        "verify-agent": cmd_verify_agent,
     }
 
     if args.command == "config":
