@@ -58,21 +58,30 @@ python scripts/sidecar.py log \
 
 ### Writable Tasks (Isolated Worktree)
 
+Writable modes (`implement`, `test-fix`) always run in an isolated git
+worktree — this is enforced by `sidecar.py`, so they can never modify the main
+working tree. The worker only produces a `patch.diff`; it is never applied,
+committed, or pushed automatically.
+
 ```bash
 # Implement in worktree
 python scripts/sidecar.py implement \
-  --goal "Add a null guard for item.location in the update flow." \
-  --worktree
+  --goal "Add a null guard for item.location in the update flow."
 
 # Fix failing tests in worktree
 python scripts/sidecar.py test-fix \
-  --goal "Fix the failing test in items.test.ts." \
-  --worktree
+  --goal "Fix the failing test in items.test.ts."
 ```
 
 ### Management
 
 ```bash
+# Diagnose the setup (opencode present, agents load as primary, models authed)
+python scripts/sidecar.py doctor
+
+# Confirm a worker agent runs without falling back to the default agent
+python scripts/sidecar.py verify-agent
+
 # List all tasks
 python scripts/sidecar.py list
 
@@ -106,6 +115,8 @@ Inspect the result files:
 ```
 .agent_sidecars/tasks/<task-id>/result.md      # Human-readable result
 .agent_sidecars/tasks/<task-id>/result.json    # Machine-readable result
+.agent_sidecars/tasks/<task-id>/worker_text.md  # Worker's text answer (from JSON text events)
+.agent_sidecars/tasks/<task-id>/events.jsonl    # Raw OpenCode event stream (one JSON object/line)
 .agent_sidecars/tasks/<task-id>/patch.diff      # (writable tasks only)
 .agent_sidecars/tasks/<task-id>/metadata.json   # Execution metadata
 ```
@@ -126,7 +137,7 @@ The model for each tier is resolved in this priority:
 1. CLI `--model <id>` (per-task override)
 2. Env var: `OPENCODE_SIDECAR_FAST_MODEL` / `OPENCODE_SIDECAR_QUALITY_MODEL`
 3. Project config file `.opencode-sidecar.json`
-4. **Auto-detect on first run** — probes `opencode models` + `opencode providers list`,
+4. **Auto-detect on first run** — probes `opencode models` + `opencode auth list`,
    keyword-scores models, picks one fast + one quality, and writes the config. A
    stderr notice points the user at `init` to confirm or change it.
 
@@ -156,41 +167,63 @@ from the listed ids and provider names, and ask the user to confirm.
 
 ## Worker Roles & Engine-Enforced Permissions
 
-Each mode maps to a dedicated OpenCode **subagent** (defined under
-`opencode/agents/`). On the first task run, `sidecar.py` syncs these agent
-definitions into the project's `.opencode/agents/` and invokes the worker with
-`opencode run --agent <name>`. OpenCode then enforces the agent's permissions at
-the engine level — a read-only worker physically cannot edit files, regardless
-of what the prompt says. The prompt constraints are a secondary guard, not the
-primary one.
+Each mode maps to a dedicated OpenCode **worker agent** (a `mode: primary`
+agent defined under `opencode/agents/`). `sidecar.py` runs the worker with
+`opencode run --agent <name>` and points OpenCode at the bundled agents via the
+`OPENCODE_CONFIG_DIR` environment variable. OpenCode then enforces the agent's
+permissions at the engine level — a read-only worker physically cannot edit
+files, regardless of what the prompt says. The prompt constraints are a
+secondary guard, not the primary one.
 
-| Mode | Subagent | Access | Engine permissions |
-|------|----------|--------|--------------------|
-| `explore` | `sidecar-explorer` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
-| `review` | `sidecar-reviewer` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
-| `log` | `sidecar-log-analyst` | Read-only | `edit`/`write` denied; `bash` limited to read-only commands |
-| `implement` | `sidecar-implementer` | Worktree-writable | `edit`/`write` allowed; `git commit`/`push`, installs, `rm -rf` denied |
-| `test-fix` | `sidecar-test-fixer` | Worktree-writable | `edit`/`write` allowed; `git commit`/`push`, installs, `rm -rf` denied |
+These agents are deliberately `mode: primary` (not `subagent`): `opencode run
+--agent` only accepts a primary agent and silently falls back to the default
+agent if given a subagent. They are still *sidecar worker agents* in product
+terms — Claude is the main brain; these workers only execute bounded tasks.
 
-OpenCode discovers agents by walking up from the working directory to find a
-`.opencode/agents/` folder, so the synced agents apply both to read-only tasks
-(run at the project root) and writable tasks (run inside a nested worktree).
-Only `sidecar-*.md` files are written — user-authored agents are left untouched.
+| Mode | Worker agent | Access | Engine permissions |
+|------|--------------|--------|--------------------|
+| `explore` | `sidecar-explorer` | Read-only | `edit` denied; secret files denied for `read`; `bash` limited to read-only commands |
+| `review` | `sidecar-reviewer` | Read-only | `edit` denied; secret files denied for `read`; `bash` limited to read-only commands |
+| `log` | `sidecar-log-analyst` | Read-only | `edit` denied; secret files denied for `read`; `bash` limited to read-only commands |
+| `implement` | `sidecar-implementer` | Worktree-writable | `edit` allowed; `git commit`/`push`/`add`/`reset`, installs, `rm -rf` denied |
+| `test-fix` | `sidecar-test-fixer` | Worktree-writable | `edit` allowed; `git commit`/`push`/`add`/`reset`, installs, `rm -rf` denied |
 
-To verify the loaded permissions yourself: `opencode agent list`.
+Agents load from the skill's bundled `opencode/` directory via
+`OPENCODE_CONFIG_DIR` — nothing is copied into your project's `.opencode/`, and
+your global/provider/auth config is left intact. Because the env var (not the
+working directory) controls discovery, the same agents load whether a task runs
+at the project root (read-only modes) or inside a nested worktree (writable
+modes).
+
+To verify the setup:
+- `python scripts/sidecar.py doctor` — static check: opencode present, every
+  worker agent loads as `primary`, models/credentials available.
+- `python scripts/sidecar.py verify-agent` — runs a minimal real prompt and
+  confirms OpenCode did not fall back to the default agent.
+- `OPENCODE_CONFIG_DIR=<skill>/opencode opencode agent list` — prints each
+  agent's resolved permission rules.
 
 ## Error Handling
 
 The script handles:
 - OpenCode not installed → clear error message.
 - Not a git repository → clear error message.
+- Worker agent missing or not `primary` → OpenCode would fall back to the
+  default agent (losing engine permissions); the script detects the fallback
+  warning, flags it as a CRITICAL security warning, and marks the task failed.
 - Worker timeout → the worker is killed but any partial output it already
   produced is preserved in `stdout.log` (output is streamed to disk, not
   buffered in memory).
 - Empty worker output → partial status.
 - Worktree creation failure → failed status.
+- Writable mode without a worktree → refused (writable workers never touch the
+  main working tree).
+- The OpenCode `--format json` output is a line-delimited **event stream**, not
+  a single answer JSON. The script parses it into events (`events.jsonl`),
+  extracts the worker's text (`worker_text.md`), and reads the structured
+  result JSON from that text.
 - Forbidden commands are detected from the worker's *executed* shell commands
-  (parsed from the JSON event stream), not from narration that merely mentions
-  them — avoiding false positives.
+  (parsed from the JSON event stream `tool_use` events), not from narration
+  that merely mentions them — avoiding false positives.
 
 All errors produce task directories with metadata for debugging.
