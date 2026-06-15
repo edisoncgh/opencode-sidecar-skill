@@ -1,15 +1,28 @@
 ---
 description: Read-only codebase exploration worker for Claude sidecar delegation.
-mode: subagent
+mode: primary
 permission:
   edit: deny
-  write: deny
-  read: allow
+  read:
+    "*": allow
+    "*.env": deny
+    "*.env.*": deny
+    "**/.env": deny
+    "**/.env.*": deny
+    "*.pem": deny
+    "*.key": deny
+    "*.p12": deny
+    "*.pfx": deny
+    "**/id_rsa": deny
+    "**/id_ed25519": deny
+    "**/credentials*": deny
+    "**/secrets*": deny
   glob: allow
   grep: allow
-  list: allow
   webfetch: deny
   websearch: deny
+  external_directory: deny
+  task: deny
   bash:
     "*": deny
     "git status*": allow

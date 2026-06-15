@@ -1,16 +1,28 @@
 ---
 description: Isolated worktree test failure fixer.
-mode: subagent
+mode: primary
 permission:
   edit: allow
-  write: allow
-  read: allow
+  read:
+    "*": allow
+    "*.env": deny
+    "*.env.*": deny
+    "**/.env": deny
+    "**/.env.*": deny
+    "*.pem": deny
+    "*.key": deny
+    "*.p12": deny
+    "*.pfx": deny
+    "**/id_rsa": deny
+    "**/id_ed25519": deny
+    "**/credentials*": deny
+    "**/secrets*": deny
   glob: allow
   grep: allow
-  list: allow
   webfetch: deny
   websearch: deny
   external_directory: deny
+  task: deny
   bash:
     "*": ask
     "git status*": allow
@@ -22,9 +34,19 @@ permission:
     "ls *": allow
     "find *": allow
     "cat *": allow
+    "npm test*": allow
+    "npm run test*": allow
+    "npm run lint*": allow
+    "pnpm test*": allow
+    "pnpm run test*": allow
+    "pnpm lint*": allow
+    "yarn test*": allow
+    "pytest*": allow
+    "git add*": deny
     "git commit*": deny
     "git push*": deny
     "git reset*": deny
+    "git checkout*": deny
     "npm install*": deny
     "npm i *": deny
     "pnpm add*": deny
