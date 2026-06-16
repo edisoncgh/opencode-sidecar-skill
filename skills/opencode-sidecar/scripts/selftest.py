@@ -18,6 +18,8 @@ No opencode, no network, no real worker. Covers:
   3. check_sensitive_files   — glob matching (pem / env / secrets)
   4. TaskConfig              — writable modes force worktree=True
   5. SidecarOrchestrator     — update_index upserts by task_id (no dup rows)
+  6. capability audit        — MCP/web/internal artifact visibility
+  7. result contract status  — structured vs fallback result.json
 """
 
 import json
@@ -162,6 +164,26 @@ def test_attempted_writes_ignores_readonly_builtins():
     assert sidecar.worker_attempted_writes(parsed) is False
 
 
+def test_capability_audit_flags_mcp_web_and_internal_reads():
+    stream = "\n".join([
+        _event("tool_use", part={"type": "tool", "tool": "read",
+                                 "state": {"input": {"filePath": "repo/.agent_sidecars/index.json"}}}),
+        _event("tool_use", part={"type": "tool", "tool": "web-reader_webReader",
+                                 "state": {"input": {"url": "https://example.com"}}}),
+        _event("tool_use", part={"type": "tool", "tool": "glob",
+                                 "state": {"input": {"pattern": "**/*"}}}),
+    ])
+    parsed = sidecar.parse_event_stream(stream)
+    audit = sidecar.audit_worker_capabilities(parsed)
+
+    assert audit["tools_used"] == ["glob", "read", "web-reader_webReader"]
+    assert audit["mcp_tools_used"] == ["web-reader_webReader"]
+    assert audit["web_access"] is True
+    assert audit["internal_artifacts_read"] is True
+    assert audit["internal_paths"] == ["repo/.agent_sidecars/index.json"]
+    assert any("MCP" in note for note in audit["policy_notes"])
+
+
 def test_claimed_changes_true_when_file_listed():
     text = "**Summary:** done\n\n**Files Changed:**\n- hello.txt — new file\n\n**Tests Run:** none"
     assert sidecar.worker_claimed_changes(text) is True
@@ -213,6 +235,35 @@ def test_index_distinct_tasks_get_distinct_rows():
         index = sidecar.read_json(orch.sidecar_dir / sidecar.INDEX_FILE)
         task_ids = [t["task_id"] for t in index["tasks"]]
         assert sorted(task_ids) == sorted(ids)
+
+
+# ── 7. Result contract status ──────────────────────────────────────────────
+
+def test_extract_result_json_marks_fallback_contract():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        orch = sidecar.SidecarOrchestrator(proj)
+        tc = sidecar.TaskConfig(mode="explore", goal="g", model="m", project_dir=proj)
+        result = orch._extract_result_json("plain markdown only", tc)
+
+        assert result["contract_status"] == "fallback"
+        assert result["_auto_generated"] is True
+        assert "Worker did not produce structured JSON output." in result["risks"]
+
+
+def test_extract_result_json_marks_structured_contract():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        orch = sidecar.SidecarOrchestrator(proj)
+        tc = sidecar.TaskConfig(mode="explore", goal="g", model="m", project_dir=proj)
+        text = """```json
+{"summary":"ok","findings":[],"risks":[],"uncertainties":[]}
+```"""
+        result = orch._extract_result_json(text, tc)
+
+        assert result["contract_status"] == "structured"
+        assert "_auto_generated" not in result
+        assert result["summary"] == "ok"
 
 
 # ── Runner ─────────────────────────────────────────────────────────────────

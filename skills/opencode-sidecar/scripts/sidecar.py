@@ -138,6 +138,18 @@ FORBIDDEN_COMMANDS = [
     "rm -rf",
 ]
 
+BUILTIN_TOOL_NAMES = {
+    "read", "bash", "grep", "glob", "list", "ls", "webfetch", "websearch",
+    "task", "todowrite", "todoread", "lsp", "skill", "question",
+}
+
+INTERNAL_PATH_MARKERS = (
+    "/.agent_sidecars/", "\\.agent_sidecars\\", ".agent_sidecars/",
+    ".agent_sidecars\\", "/.git/", "\\.git\\", ".git/", ".git\\",
+)
+
+WEB_TOOL_MARKERS = ("web", "fetch", "url", "browser")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -628,6 +640,93 @@ def check_forbidden_commands(output: str) -> list[str]:
     return violations
 
 
+def _walk_strings(value) -> list[str]:
+    """Return all string leaves inside a nested JSON-ish value."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        out: list[str] = []
+        for v in value.values():
+            out.extend(_walk_strings(v))
+        return out
+    if isinstance(value, list):
+        out: list[str] = []
+        for v in value:
+            out.extend(_walk_strings(v))
+        return out
+    return []
+
+
+def _internal_path_hits(text: str) -> list[str]:
+    """Extract compact path-ish snippets that reference sidecar/git internals."""
+    hits: list[str] = []
+    for line in text.splitlines() or [text]:
+        normalized = line.replace("\\", "/")
+        if any(marker.replace("\\", "/") in normalized for marker in INTERNAL_PATH_MARKERS):
+            snippet = line.strip()
+            if len(snippet) > 240:
+                snippet = snippet[:237] + "..."
+            if snippet:
+                hits.append(snippet)
+    return hits
+
+
+def audit_worker_capabilities(parsed: dict) -> dict:
+    """Summarize what capabilities the worker actually used.
+
+    This is intentionally an audit, not a sandbox. opencode-sidecar is a
+    lightweight skill wrapper, so inherited MCP tools may exist. We make that
+    behavior visible in result artifacts so the main agent can judge trust.
+    """
+    tools: set[str] = set()
+    mcp_tools: set[str] = set()
+    write_tools: set[str] = set()
+    internal_paths: set[str] = set()
+    web_access = False
+
+    for event in parsed.get("events", []):
+        if event.get("type") != "tool_use":
+            continue
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        tool = part.get("tool")
+        if not isinstance(tool, str):
+            continue
+
+        tools.add(tool)
+        low_tool = tool.lower()
+        if low_tool not in BUILTIN_TOOL_NAMES:
+            mcp_tools.add(tool)
+        if any(marker in low_tool for marker in WEB_TOOL_MARKERS):
+            web_access = True
+        if low_tool in {"write", "edit", "patch", "apply_patch", "multiedit"}:
+            write_tools.add(tool)
+
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        for raw in _walk_strings(state.get("input")) + _walk_strings(state.get("output")):
+            for hit in _internal_path_hits(raw):
+                internal_paths.add(hit)
+
+    notes: list[str] = []
+    if mcp_tools:
+        notes.append("Worker used inherited MCP/custom tools; review provider/tool trust.")
+    if web_access:
+        notes.append("Worker accessed web-like capability; verify the task allowed network context.")
+    if internal_paths:
+        notes.append("Worker accessed sidecar or git internal artifacts; report may include runtime noise.")
+    if write_tools:
+        notes.append("Worker invoked write-capable tools; verify this is expected for the mode.")
+
+    return {
+        "tools_used": sorted(tools),
+        "mcp_tools_used": sorted(mcp_tools),
+        "write_tools_used": sorted(write_tools),
+        "web_access": web_access,
+        "internal_artifacts_read": bool(internal_paths),
+        "internal_paths": sorted(internal_paths),
+        "policy_notes": notes,
+    }
+
+
 def detect_agent_fallback(output: str) -> str | None:
     """Detect OpenCode's "falling back to default agent" warning.
 
@@ -661,10 +760,6 @@ def worker_attempted_writes(parsed: dict) -> bool:
     or a non-persisting tool) and the task must NOT be reported as completed.
     """
     writer_tools = {"write", "edit", "patch", "apply_patch", "multiedit"}
-    builtin_tools = {
-        "read", "bash", "grep", "glob", "list", "ls", "webfetch", "websearch",
-        "task", "todowrite", "todoread", "lsp", "skill", "question",
-    }
     for event in parsed.get("events", []):
         if event.get("type") != "tool_use":
             continue
@@ -677,7 +772,7 @@ def worker_attempted_writes(parsed: dict) -> bool:
             return True
         # An MCP/custom tool (anything not a known built-in) — a worker that
         # reaches for one to write files is the failure mode we must catch.
-        if name not in builtin_tools:
+        if name not in BUILTIN_TOOL_NAMES:
             return True
     return False
 
@@ -988,6 +1083,8 @@ class SidecarOrchestrator:
         security_warnings = []
         security_warnings.extend(check_forbidden_commands(stdout))
         security_warnings.extend(check_forbidden_commands(stderr))
+        parsed_stdout = parse_event_stream(stdout)
+        capability_audit = audit_worker_capabilities(parsed_stdout)
 
         # Detect agent fallback: opencode prints a warning and runs the default
         # agent (losing all engine-enforced permissions) when --agent names a
@@ -1022,9 +1119,8 @@ class SidecarOrchestrator:
             # changes in its report, an empty patch is a lost-write failure, not
             # a clean "no-op". Don't trust the worker's self-reported success.
             if not patch_nonempty:
-                parsed_ev = parse_event_stream(stdout)
-                attempted = worker_attempted_writes(parsed_ev)
-                claimed = worker_claimed_changes(parsed_ev["text"])
+                attempted = worker_attempted_writes(parsed_stdout)
+                claimed = worker_claimed_changes(parsed_stdout["text"])
                 if attempted or claimed:
                     write_lost = True
                     security_warnings.append(
@@ -1049,7 +1145,15 @@ class SidecarOrchestrator:
             task_config.status = "completed"
 
         # Generate result files
-        self._generate_result(task_config, task_dir, stdout, stderr, security_warnings, returncode)
+        self._generate_result(
+            task_config,
+            task_dir,
+            stdout,
+            stderr,
+            security_warnings,
+            returncode,
+            capability_audit,
+        )
 
         # Write metadata
         metadata = {
@@ -1067,6 +1171,7 @@ class SidecarOrchestrator:
             "started_at": task_config.created_at,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "security_warnings": security_warnings,
+            "capability_audit": capability_audit,
         }
         write_json(task_dir / "metadata.json", metadata)
 
@@ -1220,15 +1325,29 @@ class SidecarOrchestrator:
         if task_config.mode in ("implement", "test-fix"):
             parts.append("CONSTRAINT: Do NOT commit, push, or install dependencies.")
 
+        parts.append(
+            "BOUNDARY: Do not inspect .agent_sidecars/ or .git/ unless the task "
+            "explicitly asks about sidecar internals or git internals."
+        )
+        parts.append(
+            "BOUNDARY: MCP tools may be inherited from the user's OpenCode "
+            "environment. Use them only when clearly relevant, and mention any "
+            "MCP/web/memory tool you used in the report."
+        )
+
         parts.append("")
         parts.append("Execute this task now using the available tools.")
         parts.append("Produce a structured final report with your findings.")
+        parts.append(
+            "End with a fenced ```json block containing at least: summary, "
+            "findings, risks, uncertainties, and requires_main_agent_decision."
+        )
 
         return "\n".join(parts)
 
     def _generate_result(self, task_config: TaskConfig, task_dir: Path,
                          stdout: str, stderr: str, security_warnings: list[str],
-                         returncode: int) -> None:
+                         returncode: int, capability_audit: dict | None = None) -> None:
         """Generate result artifacts from the worker's --format json output.
 
         The opencode stdout is a JSONL event stream, not the worker's answer.
@@ -1268,6 +1387,9 @@ class SidecarOrchestrator:
         if parsed["commands"] and not result_json.get("commands_run"):
             result_json["commands_run"] = parsed["commands"]
 
+        capability_audit = capability_audit or audit_worker_capabilities(parsed)
+        result_json["capability_audit"] = capability_audit
+
         # Generate result.md
         result_md_parts = [
             f"# Sidecar Result",
@@ -1288,12 +1410,25 @@ class SidecarOrchestrator:
 
         if security_warnings:
             result_md_parts.extend([
-                "## ⚠️ Security Warnings",
+                "## Security Warnings",
                 "",
             ])
             for warning in security_warnings:
                 result_md_parts.append(f"- {warning}")
             result_md_parts.append("")
+
+        result_md_parts.extend([
+            "## Capability Audit",
+            "",
+            f"- Contract status: {result_json.get('contract_status', 'unknown')}",
+            f"- Tools used: {', '.join(capability_audit.get('tools_used', [])) or 'none'}",
+            f"- MCP/custom tools used: {', '.join(capability_audit.get('mcp_tools_used', [])) or 'none'}",
+            f"- Web access observed: {str(capability_audit.get('web_access', False)).lower()}",
+            f"- Internal artifacts read: {str(capability_audit.get('internal_artifacts_read', False)).lower()}",
+        ])
+        for note in capability_audit.get("policy_notes", []):
+            result_md_parts.append(f"- Note: {note}")
+        result_md_parts.append("")
 
         if task_config.worktree:
             result_md_parts.extend([
@@ -1349,6 +1484,7 @@ class SidecarOrchestrator:
             data.setdefault("worker", task_config.worker)
             data.setdefault("model", task_config.model)
             data.setdefault("status", task_config.status)
+            data.setdefault("contract_status", "structured")
             return data
 
         # Collect fenced code block candidates (```json ... ``` or ``` ... ```).
@@ -1414,6 +1550,7 @@ class SidecarOrchestrator:
             "risks": ["Worker did not produce structured JSON output."],
             "uncertainties": ["Result was auto-generated from raw worker text."],
             "requires_main_agent_decision": True,
+            "contract_status": "fallback",
             "_auto_generated": True,
         }
 

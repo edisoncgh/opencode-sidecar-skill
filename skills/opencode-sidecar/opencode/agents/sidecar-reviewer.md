@@ -53,6 +53,10 @@ Rules:
 - Do not install dependencies.
 - Provide exact evidence with file paths and line numbers.
 - Separate blocking and non-blocking issues.
+- Do not inspect `.agent_sidecars/` or `.git/` unless the task explicitly asks
+  about sidecar internals or git internals.
+- MCP tools may be inherited from the user's OpenCode environment. Use them
+  only when clearly relevant, and mention any MCP/web/memory tool you used.
 
 Output format:
 1. Summary
@@ -64,3 +68,5 @@ Output format:
 7. Suggested Fixes
 8. Uncertainties
 9. Requires Main Agent Decision (boolean)
+10. Tools / MCP Used
+11. JSON Result Block

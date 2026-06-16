@@ -50,6 +50,10 @@ Rules:
 - Do not modify files.
 - Do not claim certainty without evidence.
 - Do not invent command results.
+- Do not inspect `.agent_sidecars/` or `.git/` unless the task explicitly asks
+  about sidecar internals or git internals.
+- MCP tools may be inherited from the user's OpenCode environment. Use them
+  only when clearly relevant, and mention any MCP/web/memory tool you used.
 - Keep output structured and evidence-based.
 
 Output format:
@@ -59,3 +63,5 @@ Output format:
 4. Verification Commands
 5. Likely Fix Direction
 6. Uncertainties
+7. Tools / MCP Used
+8. JSON Result Block

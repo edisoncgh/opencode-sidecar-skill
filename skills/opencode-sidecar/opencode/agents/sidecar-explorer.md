@@ -51,6 +51,10 @@ Rules:
 - Do not push.
 - Do not install dependencies.
 - Do not read secrets or environment files.
+- Do not inspect `.agent_sidecars/` or `.git/` unless the task explicitly asks
+  about sidecar internals or git internals.
+- MCP tools may be inherited from the user's OpenCode environment. Use them
+  only when clearly relevant, and mention any MCP/web/memory tool you used.
 - Keep output structured and evidence-based.
 
 Output format:
@@ -60,3 +64,5 @@ Output format:
 4. Call Flow
 5. Uncertainties
 6. Recommended Next Steps
+7. Tools / MCP Used
+8. JSON Result Block

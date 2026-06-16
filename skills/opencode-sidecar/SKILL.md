@@ -123,6 +123,31 @@ Inspect the result files:
 
 The main agent must verify all findings before acting.
 
+### Capability audit
+
+This skill is a lightweight delegation wrapper, not a full security sandbox.
+OpenCode may merge the user's global/project MCP tools into a worker session.
+Workers are instructed to use inherited MCP tools only when relevant and to
+report them, but the main enforcement surface is the sidecar result package:
+`result.json`, `result.md`, and `metadata.json` include a `capability_audit`
+section listing actual tools used, inherited MCP/custom tools, web-like access,
+write-capable tools, and reads of internal artifacts such as `.agent_sidecars/`
+or `.git/`.
+
+Treat the audit as part of the review surface. If a worker used unexpected MCP
+or web tools, or read sidecar/git internals, inspect the evidence before relying
+on the answer.
+
+### Result contract status
+
+Workers are asked to end with a fenced sidecar-style JSON result block. When
+that block is parseable and contains the expected result fields, `result.json`
+records `contract_status: "structured"`. If the worker only produced prose or a
+nonconforming JSON note, `sidecar.py` still preserves the Markdown report and
+creates a fallback `result.json` with `contract_status: "fallback"`,
+`confidence: "low"`, and an explicit risk. Fallback JSON is useful for routing
+and audit, but the Markdown report should be reviewed directly.
+
 ### Status semantics for writable tasks
 
 A writable task (`implement` / `test-fix`) only reports `completed` when its

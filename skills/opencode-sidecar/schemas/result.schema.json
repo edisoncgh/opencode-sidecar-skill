@@ -45,6 +45,43 @@
       "type": "string",
       "description": "Brief summary of the result"
     },
+    "contract_status": {
+      "type": "string",
+      "enum": ["structured", "fallback"],
+      "description": "Whether result.json came from a parseable worker JSON block or was synthesized from prose"
+    },
+    "capability_audit": {
+      "type": "object",
+      "description": "Post-run audit of tools and inherited capabilities actually used by the worker",
+      "properties": {
+        "tools_used": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mcp_tools_used": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "write_tools_used": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "web_access": {
+          "type": "boolean"
+        },
+        "internal_artifacts_read": {
+          "type": "boolean"
+        },
+        "internal_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "policy_notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
     "findings": {
       "type": "array",
       "items": {
